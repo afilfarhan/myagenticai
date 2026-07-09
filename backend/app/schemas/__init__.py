@@ -37,7 +37,7 @@ class SupplierUpdate(BaseModel):
     industry: Optional[str] = None
     website: Optional[str] = None
     contact_email: Optional[str] = None
-    contact_phone: Optional[str] = None] = None
+    contact_phone: Optional[str] = None
     is_active: Optional[bool] = None
     metadata: Optional[Dict[str, Any]] = None
 

@@ -69,6 +69,10 @@ memory:
     max_connections: 50
     socket_timeout: 5
     socket_connect_timeout: 5
+  embeddings:
+    provider: "sentence_transformers"
+    model: "all-MiniLM-L6-v2"
+    dimension: 384
 
 # Security Configuration
 security:
@@ -124,6 +128,12 @@ hitl:
   approval_required_for:
     - "SEVERE"
     - "CRITICAL"
+
+# Auth Configuration
+auth:
+  jwt_secret: "${JWT_SECRET_KEY}"
+  access_token_ttl_min: 15
+  refresh_token_ttl_days: 7
 
 # Database (for supplier data)
 database:

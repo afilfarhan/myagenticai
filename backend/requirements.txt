@@ -1,71 +1,76 @@
 # Core Framework
-fastapi==0.115.0
-uvicorn[standard]==0.32.0
-pydantic==2.10.0
-pydantic-settings==2.6.0
-python-dotenv==1.0.1
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pydantic>=2.10.0
+pydantic-settings>=2.6.0
+python-dotenv>=1.0.1
 
-# LangGraph & LangChain
-langgraph==0.2.42
-langchain==0.3.14
-langchain-core==0.3.33
-langchain-anthropic==0.3.5
-langchain-openai==0.2.13
-langchain-community==0.3.14
-langsmith==0.1.134
+# LangGraph & LangChain - use compatible versions
+langgraph>=0.2.42
+langchain>=0.3.14
+langchain-core>=0.3.33
+langchain-anthropic>=0.3.5
+langchain-openai>=0.2.13
+langchain-community>=0.3.14
+langsmith>=0.1.134
 
-# CrewAI
-crewai==0.80.0
+# CrewAI - comment out for now due to langchain version conflict
+# crewai>=0.11.2
 
 # LLM Providers
-anthropic==0.45.0
-openai==1.54.0
-boto3==1.35.0
+anthropic>=0.45.0
+openai>=1.54.0
+boto3>=1.35.0
 
 # Tools & Integrations
-tavily-python==0.5.0
-exa-py==1.1.2
-apify-client==1.4.0
-e2b-code-interpreter==1.0.0
+tavily-python>=0.5.0
+exa-py>=1.1.2
+apify-client>=1.4.0
+e2b-code-interpreter>=1.0.0
 
 # MCP (Model Context Protocol)
-mcp==1.0.0
+mcp>=1.0.0
+
+# Database
+sqlalchemy[asyncio]>=2.0.0
+aiosqlite>=0.20.0
 
 # Memory & Vector Stores
-pinecone==5.0.0
-redis==5.2.0
-sentence-transformers==3.2.0
+pinecone>=5.0.0
+redis>=5.2.0
+sentence-transformers>=3.2.0
 
 # Document Processing
-unstructured==0.16.0
-unstructured-inference==0.11.0
-pypdf==4.2.0
-python-docx==1.1.0
+unstructured>=0.16.0
+unstructured-inference>=0.11.0
+pypdf>=4.2.0
+python-docx>=1.1.0
 
 # Security & Guardrails
-guardrails-ai==0.6.0
-presidio-analyzer==2.2.355
-presidio-anonymizer==2.2.355
+guardrails-ai>=0.6.0
+presidio-analyzer>=2.2.355
+presidio-anonymizer>=2.2.355
 
 # Observability & Evaluation
-wandb==0.17.0
-weave==0.49.0
+wandb>=0.17.0
+weave>=0.49.0
 
 # Utilities
-httpx==0.27.0
-tenacity==8.5.0
-python-json-logger==2.0.7
-structlog==24.1.0
-prometheus-client==0.20.0
+httpx>=0.27.0
+tenacity>=8.5.0
+python-json-logger>=2.0.7
+structlog>=24.1.0
+prometheus-client>=0.20.0
+jsonschema>=4.20.0
+faker>=20.0.0
 
 # Testing
-pytest==8.3.0
-pytest-asyncio==0.23.0
-pytest-mock==3.14.0
-httpx==0.27.0
+pytest>=8.3.0
+pytest-asyncio>=0.23.0
+pytest-mock>=3.14.0
 
 # Development
-black==24.8.0
-ruff==0.6.0
-mypy==1.11.0
-pre-commit==3.8.0
+black>=24.8.0
+ruff>=0.6.0
+mypy>=1.11.0
+pre-commit>=3.8.0
