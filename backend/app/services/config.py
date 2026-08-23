@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Optional, Any, Dict, List
 from functools import lru_cache
 
+from dotenv import load_dotenv
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 import yaml
@@ -72,6 +73,14 @@ class DatabaseConfig(BaseSettings):
     pool_size: int = Field(default=10)
     max_overflow: int = Field(default=20)
 
+    @field_validator("url", mode="before")
+    @classmethod
+    def _default_unresolved_placeholder(cls, v):
+        """Fall back to local SQLite when ${DATABASE_URL} is not set."""
+        if isinstance(v, str) and v.startswith("${") and v.endswith("}"):
+            return "sqlite+aiosqlite:///./sentinelchain.db"
+        return v
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -88,6 +97,7 @@ class Settings(BaseSettings):
     debug: bool = Field(default=True)
     host: str = Field(default="0.0.0.0")
     port: int = Field(default=8000)
+    cors_origins: List[str] = Field(default_factory=lambda: ["http://localhost:3000"])
     
     # Sub-configurations
     llm: LLMSettings = Field(default_factory=LLMSettings)
@@ -112,23 +122,41 @@ class Settings(BaseSettings):
     @classmethod
     def from_yaml(cls, yaml_path: str = "config.yaml") -> "Settings":
         """Load settings from YAML file, then override with .env"""
+        # Make ${VAR} placeholders in YAML resolvable from .env / environment.
+        load_dotenv()
+
         config_path = Path(yaml_path)
         if config_path.exists():
             with open(config_path, "r") as f:
                 yaml_data = yaml.safe_load(f) or {}
-            
-            # Flatten nested dict for SettingsConfigDict
+
+            def _expand(value):
+                if isinstance(value, str) and "${" in value:
+                    return os.path.expandvars(value)
+                if isinstance(value, dict):
+                    return {k: _expand(v) for k, v in value.items()}
+                if isinstance(value, list):
+                    return [_expand(v) for v in value]
+                return value
+
+            yaml_data = _expand(yaml_data)
+
+            # Flatten nested dict for SettingsConfigDict.
+            # The `app` section maps to top-level Settings fields.
             flat_data = {}
             for key, value in yaml_data.items():
                 if isinstance(value, dict):
+                    if key == "app":
+                        flat_data.update(value)
+                        continue
                     for sub_key, sub_value in value.items():
                         flat_data[f"{key}__{sub_key}"] = sub_value
                 else:
                     flat_data[key] = value
-            
+
             # Create instance with YAML data, .env will override via pydantic
             return cls(**flat_data)
-        
+
         return cls()
 
 

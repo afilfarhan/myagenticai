@@ -1,7 +1,7 @@
 """
 Database service for SentinelChain - SQLAlchemy async models and session management
 """
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, AsyncGenerator
 from uuid import UUID, uuid4
 
@@ -486,6 +486,105 @@ class DatabaseService:
                 .order_by(InvestigationDB.created_at.desc())
             )
             return list(result.scalars().all())
+
+    async def list_investigations(
+        self,
+        supplier_id: Optional[UUID] = None,
+        status: Optional[str] = None,
+        workflow_type: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[tuple[InvestigationDB, Optional[str]]], int]:
+        """List investigations with optional filters, joined with supplier name."""
+        from sqlalchemy import select, func
+        async with self._factory() as session:
+            query = select(InvestigationDB, SupplierDB.name).outerjoin(
+                SupplierDB, InvestigationDB.supplier_id == SupplierDB.id
+            )
+            if supplier_id:
+                query = query.where(InvestigationDB.supplier_id == supplier_id)
+            if status:
+                query = query.where(InvestigationDB.status == status.upper())
+            if workflow_type:
+                query = query.where(InvestigationDB.workflow_type == workflow_type.upper())
+
+            count_query = select(func.count()).select_from(query.subquery())
+            total = await session.scalar(count_query) or 0
+
+            query = query.order_by(InvestigationDB.created_at.desc()).limit(limit).offset(offset)
+            result = await session.execute(query)
+            rows = [(row[0], row[1]) for row in result.all()]
+            return rows, int(total)
+
+    async def list_recent_risk_factors(
+        self,
+        hours: Optional[int] = None,
+        level: Optional[str] = None,
+        limit: int = 50,
+    ) -> list[tuple[RiskFactorDB, str]]:
+        """Recent risk factors joined with supplier name, newest first.
+
+        If `hours` is given, only factors detected within the window are returned.
+        """
+        from sqlalchemy import select
+        async with self._factory() as session:
+            query = select(RiskFactorDB, SupplierDB.name).join(
+                SupplierDB, RiskFactorDB.supplier_id == SupplierDB.id
+            )
+            if hours is not None:
+                since = datetime.utcnow() - timedelta(hours=hours)
+                query = query.where(RiskFactorDB.detected_at >= since)
+            if level:
+                query = query.where(RiskFactorDB.level == level.upper())
+            query = query.order_by(RiskFactorDB.detected_at.desc()).limit(limit)
+            result = await session.execute(query)
+            return [(row[0], row[1]) for row in result.all()]
+
+    async def list_risk_factors_for_supplier(self, supplier_id: UUID) -> list[RiskFactorDB]:
+        from sqlalchemy import select
+        async with self._factory() as session:
+            result = await session.execute(
+                select(RiskFactorDB)
+                .where(RiskFactorDB.supplier_id == supplier_id)
+                .order_by(RiskFactorDB.detected_at.desc())
+            )
+            return list(result.scalars().all())
+
+    async def get_dashboard_metrics(self) -> dict:
+        """Aggregate dashboard metrics in a single round trip."""
+        from sqlalchemy import select, func
+        async with self._factory() as session:
+            total_suppliers = await session.scalar(
+                select(func.count()).select_from(SupplierDB).where(SupplierDB.is_active.is_(True))
+            ) or 0
+
+            avg_risk_score = await session.scalar(
+                select(func.avg(SupplierDB.risk_score)).where(SupplierDB.is_active.is_(True))
+            )
+
+            active_workflows = await session.scalar(
+                select(func.count()).select_from(InvestigationDB).where(InvestigationDB.status == "RUNNING")
+            ) or 0
+
+            day_ago = datetime.utcnow() - timedelta(hours=24)
+            risk_alerts_24h = await session.scalar(
+                select(func.count()).select_from(RiskFactorDB).where(RiskFactorDB.detected_at >= day_ago)
+            ) or 0
+
+            month_ago = datetime.utcnow() - timedelta(days=30)
+            cost_last_30_days = await session.scalar(
+                select(func.coalesce(func.sum(CostTrackingDB.cost_usd), 0.0)).where(
+                    CostTrackingDB.created_at >= month_ago
+                )
+            ) or 0.0
+
+            return {
+                "total_suppliers": int(total_suppliers),
+                "active_workflows": int(active_workflows),
+                "risk_alerts_24h": int(risk_alerts_24h),
+                "avg_risk_score": round(float(avg_risk_score or 0.0), 2),
+                "cost_last_30_days": round(float(cost_last_30_days), 4),
+            }
 
 
 # Global service instance

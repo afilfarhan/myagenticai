@@ -136,7 +136,7 @@ class MemoryManager:
                 risk_score=supplier.risk_score,
                 last_assessed=supplier.last_assessed,
                 is_active=supplier.is_active,
-                metadata=supplier.metadata,
+                supplier_metadata=supplier.metadata,
                 created_at=supplier.created_at,
                 updated_at=supplier.updated_at,
             )
@@ -220,7 +220,7 @@ class MemoryManager:
                 risk_score=db_supplier.risk_score,
                 last_assessed=db_supplier.last_assessed,
                 is_active=db_supplier.is_active,
-                metadata=db_supplier.metadata,
+                metadata=db_supplier.supplier_metadata,
                 created_at=db_supplier.created_at,
                 updated_at=db_supplier.updated_at,
             )
@@ -256,7 +256,7 @@ class MemoryManager:
                 risk_score=s.risk_score,
                 last_assessed=s.last_assessed,
                 is_active=s.is_active,
-                metadata=s.metadata,
+                metadata=s.supplier_metadata,
                 created_at=s.created_at,
                 updated_at=s.updated_at,
             )
@@ -480,11 +480,16 @@ class MemoryManager:
             return None
     
     # --- Agent Communication ---
-    
+
     async def send_agent_message(self, message: AgentMessage) -> bool:
         """Send message to agent via Redis pub/sub"""
         channel = f"agent:{message.to_agent.value}" if message.to_agent else "agent:broadcast"
         return await self.redis.publish(channel, message.model_dump(mode="json"))
+
+    async def publish_workflow_event(self, workflow_id: UUID, event: Dict[str, Any]) -> bool:
+        """Publish an event to the per-workflow SSE channel"""
+        channel = f"workflow:{workflow_id}:events"
+        return await self.redis.publish(channel, event)
     
     async def subscribe_agent(self, agent_role: str) -> "asyncio.Queue":
         """Subscribe to agent channel"""

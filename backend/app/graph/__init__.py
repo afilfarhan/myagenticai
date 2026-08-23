@@ -21,10 +21,32 @@ from app.agents import (
     AgentContext, AgentResult
 )
 from app.tools import ToolRegistry
-from app.memory import MemoryManager
+from app.memory import MemoryManager, get_memory_manager
 from app.config import get_config
 
 logger = structlog.get_logger(__name__)
+
+
+async def publish_workflow_step(state: "GraphState", message: str) -> None:
+    """Publish a real-time workflow event to the SSE channel (best effort)."""
+    try:
+        memory_manager = await get_memory_manager()
+        await memory_manager.publish_workflow_event(state.workflow_id, {
+            "workflow_id": str(state.workflow_id),
+            "agent": state.current_agent,
+            "message": message,
+            "status": state.status,
+            "step": state.step_count,
+            "hitl_required": state.hitl_required,
+            "hitl_payload": state.hitl_payload,
+            "timestamp": datetime.utcnow().isoformat(),
+        })
+    except Exception as exc:
+        logger.warning(
+            "Failed to publish workflow event",
+            workflow_id=str(state.workflow_id),
+            error=str(exc),
+        )
 
 
 # Extended state for LangGraph
@@ -37,10 +59,16 @@ class GraphState(WorkflowState):
     config: Dict[str, Any] = {}
 
 
-def create_initial_state(workflow_type: WorkflowType, supplier_id: UUID = None, query: str = None, config: Dict = None) -> GraphState:
+def create_initial_state(
+    workflow_type: WorkflowType,
+    supplier_id: UUID = None,
+    query: str = None,
+    config: Dict = None,
+    workflow_id: UUID = None,
+) -> GraphState:
     """Create initial graph state"""
     return GraphState(
-        workflow_id=uuid4(),
+        workflow_id=workflow_id or uuid4(),
         workflow_type=workflow_type,
         supplier_id=supplier_id,
         status="RUNNING",
@@ -101,7 +129,10 @@ async def scout_node(state: GraphState) -> GraphState:
         "content": f"Scout gathered {len(result.context.evidence)} pieces of evidence",
         "timestamp": datetime.utcnow().isoformat()
     })
-    
+    await publish_workflow_step(
+        state, f"Scout gathered {len(state.agent_context.evidence)} pieces of evidence"
+    )
+
     # Determine next agent
     if result.next_agent:
         state.current_agent = result.next_agent.value
@@ -135,7 +166,10 @@ async def analyst_node(state: GraphState) -> GraphState:
         "content": f"Analyst identified {len(result.context.risk_factors)} risk factors",
         "timestamp": datetime.utcnow().isoformat()
     })
-    
+    await publish_workflow_step(
+        state, f"Analyst identified {len(state.risk_factors_identified)} risk factors"
+    )
+
     if result.next_agent:
         state.current_agent = result.next_agent.value
     
@@ -149,7 +183,7 @@ async def auditor_node(state: GraphState) -> GraphState:
     config = get_config()
     
     auditor = AuditorAgent(config={
-        "compliance_rules": config.config.get("compliance_rules", {}),
+        "compliance_rules": {},
         "llm": config.llm.secure.model_dump() if hasattr(config.llm.secure, 'model_dump') else {}
     })
     
@@ -168,7 +202,10 @@ async def auditor_node(state: GraphState) -> GraphState:
         "content": f"Auditor completed compliance check. HITL required: {state.hitl_required}",
         "timestamp": datetime.utcnow().isoformat()
     })
-    
+    await publish_workflow_step(
+        state, f"Auditor completed compliance check. HITL required: {state.hitl_required}"
+    )
+
     if result.next_agent:
         state.current_agent = result.next_agent.value
     elif state.hitl_required:
@@ -187,7 +224,7 @@ async def mitigator_node(state: GraphState) -> GraphState:
     
     mitigator = MitigatorAgent(config={
         "tools": tool_registry.tools,
-        "action_templates": config.config.get("action_templates", {}),
+        "action_templates": {},
         "llm": config.llm.primary.model_dump() if hasattr(config.llm.primary, 'model_dump') else {}
     })
     
@@ -208,7 +245,10 @@ async def mitigator_node(state: GraphState) -> GraphState:
         "content": f"Mitigator generated {len(result.context.mitigation_actions)} actions and {len(result.context.alternative_suppliers)} alternatives",
         "timestamp": datetime.utcnow().isoformat()
     })
-    
+    await publish_workflow_step(
+        state, f"Mitigator generated {len(state.mitigation_actions)} mitigation actions"
+    )
+
     return state
 
 
@@ -261,7 +301,9 @@ async def hitl_resume_node(state: GraphState) -> GraphState:
             "content": "Escalated to senior compliance officer",
             "timestamp": datetime.utcnow().isoformat()
         })
-    
+
+    await publish_workflow_step(state, f"HITL response received: {action}")
+
     return state
 
 
@@ -396,58 +438,171 @@ class SentinelWorkflowRunner:
     async def close(self):
         await self.memory.close()
     
-    async def run_autonomous_discovery(self, supplier_id: UUID) -> GraphState:
+    async def _run_graph(self, initial_state: GraphState) -> GraphState:
+        """Execute the graph and persist/publish the terminal event."""
+        config = {"thread_id": str(initial_state.workflow_id)}
+        result = await self.graph.ainvoke(initial_state, config=config)
+
+        if isinstance(result, GraphState):
+            await self.memory.save_workflow_state(result)
+            await self._publish_terminal_event(result)
+
+        return result
+
+    async def _publish_terminal_event(self, state: GraphState) -> None:
+        """Publish the terminal workflow event so SSE clients stop listening."""
+        try:
+            await self.memory.publish_workflow_event(state.workflow_id, {
+                "workflow_id": str(state.workflow_id),
+                "agent": state.current_agent,
+                "message": f"Workflow finished with status {state.status}",
+                "status": state.status,
+                "step": state.step_count,
+                "hitl_required": state.hitl_required,
+                "hitl_payload": state.hitl_payload,
+                "summary": state.state_data.get("summary"),
+                "timestamp": datetime.utcnow().isoformat(),
+            })
+        except Exception as exc:
+            self.logger.warning(
+                "Failed to publish terminal workflow event",
+                workflow_id=str(state.workflow_id),
+                error=str(exc),
+            )
+
+    async def run_autonomous_discovery(self, supplier_id: UUID, workflow_id: UUID = None) -> GraphState:
         """Run autonomous risk discovery workflow (Workflow 1)"""
         initial_state = create_initial_state(
             workflow_type=WorkflowType.AUTONOMOUS_DISCOVERY,
-            supplier_id=supplier_id
+            supplier_id=supplier_id,
+            workflow_id=workflow_id
         )
-        
-        config = {"thread_id": str(initial_state.workflow_id)}
-        result = await self.graph.ainvoke(initial_state, config=config)
-        
-        # Save final state
-        if isinstance(result, GraphState):
-            await self.memory.save_workflow_state(result)
-        
-        return result
-    
-    async def run_deep_dive_investigation(self, supplier_id: UUID = None, supplier_name: str = None, query: str = "") -> GraphState:
-        """Run deep-dive investigation workflow (Workflow 2)"""
+
+        return await self._run_graph(initial_state)
+
+    async def run_deep_dive_investigation(self, supplier_id: UUID = None, supplier_name: str = None, query: str = "", workflow_id: UUID = None) -> GraphState:
+        """Run deep-dive investigation workflow (Workflow 2).
+
+        Uses the CrewAI engine when `crewai.enabled` is set in config, falling
+        back to the LangGraph pipeline transparently on any crew failure.
+        """
+        cfg = get_config()
+        if (getattr(cfg, "crewai", {}) or {}).get("enabled"):
+            try:
+                return await self._run_deep_dive_crew(
+                    supplier_id=supplier_id,
+                    supplier_name=supplier_name,
+                    query=query,
+                    workflow_id=workflow_id,
+                )
+            except Exception as exc:
+                self.logger.error(
+                    "Deep-dive crew failed; falling back to LangGraph",
+                    workflow_id=str(workflow_id) if workflow_id else None,
+                    error=str(exc),
+                )
+
         initial_state = create_initial_state(
             workflow_type=WorkflowType.DEEP_DIVE_INVESTIGATION,
             supplier_id=supplier_id,
-            query=query
+            query=query,
+            workflow_id=workflow_id
         )
         initial_state.state_data["supplier_name"] = supplier_name
-        
-        config = {"thread_id": str(initial_state.workflow_id)}
-        result = await self.graph.ainvoke(initial_state, config=config)
-        
-        if isinstance(result, GraphState):
-            await self.memory.save_workflow_state(result)
-        
-        return result
-    
+
+        return await self._run_graph(initial_state)
+
+    async def _run_deep_dive_crew(self, supplier_id: UUID = None, supplier_name: str = None, query: str = "", workflow_id: UUID = None) -> GraphState:
+        """Execute the deep dive with the CrewAI engine."""
+        from app.crews import DeepDiveCrew
+
+        wf_id = workflow_id or uuid4()
+        state = create_initial_state(
+            workflow_type=WorkflowType.DEEP_DIVE_INVESTIGATION,
+            supplier_id=supplier_id,
+            query=query,
+            workflow_id=wf_id,
+        )
+        state.state_data["supplier_name"] = supplier_name
+
+        supplier_context: Dict[str, Any] = {}
+        if supplier_id:
+            try:
+                supplier = await self.memory.db.get_supplier(supplier_id)
+                if supplier:
+                    supplier_context = {
+                        "name": supplier.name,
+                        "country": supplier.country,
+                        "industry": supplier.industry,
+                        "risk_score": supplier.risk_score,
+                    }
+            except Exception as exc:
+                self.logger.warning("Could not load supplier context for crew",
+                                    workflow_id=str(wf_id), error=str(exc))
+
+        crew = DeepDiveCrew(
+            workflow_id=wf_id,
+            supplier_name=supplier_name,
+            query=query,
+            supplier_context=supplier_context,
+        )
+        result = await crew.run()
+
+        state.state_data["crew_result"] = {k: v for k, v in result.items() if k != "summary"}
+        summary = result.get("summary")
+        if isinstance(summary, str):
+            state.state_data["summary"] = summary
+        state.status = "COMPLETED"
+        state.completed_at = datetime.utcnow()
+        state.current_agent = AgentRole.MITIGATOR.value
+
+        await self.memory.save_workflow_state(state)
+        await self._persist_crew_risk_factors(state, result)
+        await self._publish_terminal_event(state)
+        return state
+
+    async def _persist_crew_risk_factors(self, state: GraphState, result: Dict[str, Any]) -> None:
+        """Best-effort persistence of structured risk factors from the crew output."""
+        factors = result.get("risk_factors")
+        if not isinstance(factors, list) or not factors:
+            return
+        try:
+            investigation = await self.memory.db.get_investigation(state.workflow_id)
+            if not (investigation and state.supplier_id):
+                return
+            for factor in factors[:20]:
+                if not isinstance(factor, dict):
+                    continue
+                try:
+                    category = RiskCategory(str(factor.get("category", "")).upper())
+                    level = RiskLevel(str(factor.get("level", "")).upper())
+                except ValueError:
+                    continue
+                await self.memory.db.add_risk_factor(
+                    supplier_id=state.supplier_id,
+                    investigation_id=investigation.id,
+                    category=category.value,
+                    level=level.value,
+                    title=str(factor.get("title", "Untitled risk"))[:255],
+                    description=str(factor.get("description", "")),
+                    confidence=float(factor.get("confidence", 0.5) or 0.5),
+                    risk_metadata={"engine": "crewai"},
+                )
+        except Exception as exc:
+            self.logger.warning("Failed to persist crew risk factors",
+                                workflow_id=str(state.workflow_id), error=str(exc))
+
     async def resume_after_hitl(self, workflow_id: UUID, hitl_response: Dict[str, Any]) -> GraphState:
         """Resume workflow after HITL response"""
-        config = {"thread_id": str(workflow_id)}
-        
         # Get current state
         current_state = await self.memory.get_workflow_state(workflow_id)
         if not current_state:
             raise ValueError(f"Workflow {workflow_id} not found")
-        
+
         # Add HITL response to state
         current_state.hitl_response = hitl_response
-        
-        # Resume graph
-        result = await self.graph.ainvoke(current_state, config=config)
-        
-        if isinstance(result, GraphState):
-            await self.memory.save_workflow_state(result)
-        
-        return result
+
+        return await self._run_graph(current_state)
     
     async def get_workflow_status(self, workflow_id: UUID) -> Optional[GraphState]:
         """Get current workflow status"""

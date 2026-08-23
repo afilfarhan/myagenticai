@@ -38,6 +38,7 @@ class SupplierUpdate(BaseModel):
     website: Optional[str] = None
     contact_email: Optional[str] = None
     contact_phone: Optional[str] = None
+    risk_score: Optional[float] = Field(default=None, ge=0.0, le=100.0)
     is_active: Optional[bool] = None
     metadata: Optional[Dict[str, Any]] = None
 
@@ -219,3 +220,45 @@ class MetricsResponse(BaseModel):
     avg_risk_score: float
     cost_last_30_days: float
     false_positive_rate: float
+
+
+class InvestigationSummaryResponse(BaseModel):
+    workflow_id: UUID
+    supplier_id: Optional[UUID]
+    supplier_name: Optional[str]
+    workflow_type: WorkflowType
+    status: str
+    query: Optional[str] = None
+    hitl_required: bool = False
+    hitl_status: Optional[str] = None
+    error: Optional[str] = None
+    step_count: int = 0
+    created_at: datetime
+    updated_at: datetime
+    completed_at: Optional[datetime]
+
+
+class InvestigationListResponse(BaseModel):
+    investigations: List[InvestigationSummaryResponse]
+    total: int
+    limit: int
+    offset: int
+
+
+class RiskAlertResponse(BaseModel):
+    id: UUID
+    supplier_id: UUID
+    supplier_name: str
+    category: str
+    level: str
+    title: str
+    description: str
+    confidence: float
+    impact_score: float
+    likelihood_score: float
+    detected_at: datetime
+
+
+class AlertListResponse(BaseModel):
+    alerts: List[RiskAlertResponse]
+    total: int

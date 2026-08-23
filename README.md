@@ -168,25 +168,27 @@ curl http://localhost:8000/api/v1/agents/status
 - **AnalystAgent**: LLM risk synthesis with Guardrails validation, evidence citation enforcement, semantic caching
 - **AuditorAgent**: OFAC/CSDDD/ESG/export control checks, HITL trigger for SEVERE/CRITICAL
 - **MitigatorAgent**: LLM mitigation generation + Pinecone alternative supplier search
-- **OrchestratorAgent**: CrewAI integration for deep-dive, LangGraph for autonomous discovery
+- **OrchestratorAgent**: LangGraph for both workflows; optional **CrewAI deep-dive engine** (`app/crews`, enable with `crewai.enabled: true` in `backend/config.yaml`; requires Python ≥3.11,<3.13; falls back to LangGraph on failure)
 
 ### ✅ Phase 4 — LangGraph Workflow (Complete)
 - **HITL Interrupts**: `interrupt_before=["auditor"]` with `Command(resume=hitl_response)`
-- **SSE Streaming**: Redis pub/sub per workflow, real-time agent step updates
+- **SSE Streaming**: Investigations start asynchronously (`POST /api/v1/investigations` returns `RUNNING`); graph nodes publish step events to Redis pub/sub channel `workflow:{id}:events`, streamed live at `/api/v1/investigations/{id}/stream`
 - **Cost Tracking**: Per-workflow/supplier token usage and USD cost
 
 ### ✅ Phase 5 — API Completion (Complete)
 - **Supplier CRUD**: Full lifecycle with vector store sync + background tasks
-- **Investigation CRUD**: Start, status, SSE stream, HITL resume
+- **Investigation APIs**: Start (background), status, list w/ filters, SSE stream, HITL resume
+- **Dashboard APIs**: Real `/metrics` aggregates, `/api/v1/alerts/recent`, per-supplier risk factors
 - **Dev Seed Endpoint**: `POST /api/v1/seed` generates 50 dummy suppliers
 - **Agent Status**: Real capabilities from registered agents
 
 ### ✅ Phase 6 — Frontend Integration (Complete)
-- **API Client**: REST + SSE with auth headers
-- **Dashboard**: Real stats, agent health, recent alerts, active workflows
-- **Suppliers**: Filterable table, risk bars, add supplier modal
-- **Investigations**: Streaming SSE updates, HITL panel, results view
-- **Build**: ✅ Compiles (6 static pages, 86.9 kB shared JS)
+- **API Client**: Axios instance with auth-header interceptor + typed helpers (`frontend/src/lib/api.ts`); SSE wrapper
+- **State**: Zustand workflow store (`src/stores/workflow.ts`) driving the investigations page (start → stream → HITL → result)
+- **Dashboard**: Live metrics, agent health from `/api/v1/agents/status`, recent alerts, active workflows (React Query)
+- **Suppliers**: Debounced search + tier/country filters, add-supplier modal, risk bars
+- **Supplier Detail**: `/suppliers/[id]` — profile, risk factors, investigation history
+- **Investigations**: Live SSE timeline, HITL approval panel, result summary
 
 ### ✅ Phase 7 — Observability, Eval & Security (Complete)
 - **LangSmith Tracing**: `@traceable` on all agents, tools, LLM calls

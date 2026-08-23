@@ -3,7 +3,7 @@ FastAPI application for SentinelChain
 """
 from contextlib import asynccontextmanager
 from typing import Optional, List
-from uuid import UUID
+from uuid import UUID, uuid4
 from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -28,7 +28,9 @@ from app.schemas import (
     SupplierCreate, SupplierUpdate, SupplierResponse, SupplierListResponse,
     InvestigationRequestSchema, InvestigationResponseSchema,
     HITLResponseSchema, HealthCheckResponse, MetricsResponse,
-    WorkflowStatusResponse
+    WorkflowStatusResponse,
+    InvestigationSummaryResponse, InvestigationListResponse,
+    RiskAlertResponse, AlertListResponse, RiskFactorResponse,
 )
 from app.api.audit import router as audit_router
 from app.api.auth import get_current_user, get_current_user_optional
@@ -111,7 +113,7 @@ app = FastAPI(
 config = get_config()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"] if config.environment == "development" else ["https://yourdomain.com"],
+    allow_origins=config.cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -161,15 +163,9 @@ async def health_check():
 @app.get("/metrics", response_model=MetricsResponse)
 async def get_metrics(db: DatabaseService = Depends(get_db)):
     """Get system metrics"""
-    # In production, query actual metrics from monitoring systems
-    return MetricsResponse(
-        total_suppliers=0,
-        active_workflows=0,
-        risk_alerts_24h=0,
-        avg_risk_score=0.0,
-        cost_last_30_days=0.0,
-        false_positive_rate=0.0
-    )
+    metrics = await db.get_dashboard_metrics()
+    # false_positive_rate requires labeled feedback data; no source yet.
+    return MetricsResponse(false_positive_rate=0.0, **metrics)
 
 
 # Supplier Management - Real Implementation
@@ -196,10 +192,8 @@ async def create_supplier(
         website=supplier.website,
         contact_email=supplier.contact_email,
         contact_phone=supplier.contact_phone,
-        risk_score=supplier.risk_score,
-        last_assessed=supplier.last_assessed,
-        is_active=supplier.is_active,
-        metadata=supplier.metadata,
+        is_active=True,
+        supplier_metadata=supplier.metadata,
     )
     
     # Convert to Pydantic model
@@ -217,11 +211,11 @@ async def create_supplier(
         risk_score=db_supplier.risk_score,
         last_assessed=db_supplier.last_assessed,
         is_active=db_supplier.is_active,
-        metadata=db_supplier.metadata,
+        metadata=db_supplier.supplier_metadata,
         created_at=db_supplier.created_at,
         updated_at=db_supplier.updated_at,
     )
-    
+
     # Generate embedding and store in vector store (background task)
     background_tasks.add_task(save_supplier_to_vector_store, created)
     
@@ -275,7 +269,7 @@ async def list_suppliers(
             risk_score=s.risk_score,
             last_assessed=s.last_assessed,
             is_active=s.is_active,
-            metadata=s.metadata,
+            metadata=s.supplier_metadata,
             created_at=s.created_at,
             updated_at=s.updated_at,
         )
@@ -311,12 +305,40 @@ async def get_supplier(supplier_id: UUID, db: DatabaseService = Depends(get_db))
         risk_score=db_supplier.risk_score,
         last_assessed=db_supplier.last_assessed,
         is_active=db_supplier.is_active,
-        metadata=db_supplier.metadata,
+        metadata=db_supplier.supplier_metadata,
         created_at=db_supplier.created_at,
         updated_at=db_supplier.updated_at,
     )
-    
+
     return SupplierResponse(**supplier.model_dump())
+
+
+@app.get("/api/v1/suppliers/{supplier_id}/risk-factors", response_model=List[RiskFactorResponse])
+async def list_supplier_risk_factors(supplier_id: UUID, db: DatabaseService = Depends(get_db)):
+    """List risk factors detected for a supplier"""
+    if not await db.get_supplier(supplier_id):
+        raise HTTPException(status_code=404, detail="Supplier not found")
+
+    factors = await db.list_risk_factors_for_supplier(supplier_id)
+    return [
+        RiskFactorResponse(
+            id=f.id,
+            supplier_id=f.supplier_id,
+            category=RiskCategory(f.category),
+            level=RiskLevel(f.level),
+            title=f.title,
+            description=f.description,
+            evidence_ids=f.evidence_ids or [],
+            confidence=f.confidence,
+            impact_score=f.impact_score,
+            likelihood_score=f.likelihood_score,
+            detected_at=f.detected_at,
+            acknowledged_at=f.acknowledged_at,
+            resolved_at=f.resolved_at,
+            metadata=f.risk_metadata or {},
+        )
+        for f in factors
+    ]
 
 
 @app.patch("/api/v1/suppliers/{supplier_id}", response_model=SupplierResponse)
@@ -328,10 +350,14 @@ async def update_supplier(
 ):
     """Update supplier"""
     update_data = supplier_update.model_dump(exclude_unset=True)
-    
-    # Convert tier enum to string
+
+    # Map API field names to database column names
     if "tier" in update_data and hasattr(update_data["tier"], "value"):
         update_data["tier"] = update_data["tier"].value
+    if "metadata" in update_data:
+        update_data["supplier_metadata"] = update_data.pop("metadata")
+    if "risk_score" in update_data:
+        update_data["last_assessed"] = __import__('datetime').datetime.utcnow()
     
     db_supplier = await db.update_supplier(supplier_id, **update_data)
     if not db_supplier:
@@ -352,7 +378,7 @@ async def update_supplier(
         risk_score=db_supplier.risk_score,
         last_assessed=db_supplier.last_assessed,
         is_active=db_supplier.is_active,
-        metadata=db_supplier.metadata,
+        metadata=db_supplier.supplier_metadata,
         created_at=db_supplier.created_at,
         updated_at=db_supplier.updated_at,
     )
@@ -407,48 +433,176 @@ async def seed_data(db: DatabaseService = Depends(get_db)):
 
 
 # Workflow Endpoints
+async def _resolve_or_create_supplier(
+    db: DatabaseService,
+    supplier_id: Optional[UUID],
+    supplier_name: Optional[str],
+    fallback_query: str,
+) -> UUID:
+    """Resolve a supplier for an investigation, creating a placeholder when needed."""
+    if supplier_id:
+        return supplier_id
+
+    name = (supplier_name or "").strip() or fallback_query.strip()[:80]
+    existing = await db.get_supplier_by_name(supplier_name.strip()) if supplier_name and supplier_name.strip() else None
+    if existing:
+        return existing.id
+
+    created = await db.create_supplier(
+        name=name,
+        tier="UNKNOWN",
+        country="UNKNOWN",
+        supplier_metadata={"placeholder": True},
+    )
+    logger.info("Placeholder supplier created for investigation",
+                supplier_id=str(created.id), name=name)
+    return created.id
+
+
+async def _execute_workflow(
+    runner: SentinelWorkflowRunner,
+    workflow_type: WorkflowType,
+    supplier_id: UUID,
+    supplier_name: Optional[str],
+    query: str,
+    workflow_id: UUID,
+) -> None:
+    """Background task that runs a workflow to completion."""
+    try:
+        if workflow_type == WorkflowType.AUTONOMOUS_DISCOVERY:
+            await runner.run_autonomous_discovery(supplier_id, workflow_id=workflow_id)
+        else:
+            await runner.run_deep_dive_investigation(
+                supplier_id=supplier_id,
+                supplier_name=supplier_name,
+                query=query,
+                workflow_id=workflow_id,
+            )
+    except Exception as exc:
+        logger.error("Workflow execution failed",
+                     workflow_id=str(workflow_id), error=str(exc))
+        try:
+            memory_manager = await get_memory_manager()
+            await memory_manager.publish_workflow_event(workflow_id, {
+                "workflow_id": str(workflow_id),
+                "agent": None,
+                "message": f"Workflow failed: {exc}",
+                "status": "FAILED",
+                "step": 0,
+                "hitl_required": False,
+                "hitl_payload": None,
+                "timestamp": __import__('datetime').datetime.utcnow().isoformat(),
+            })
+        except Exception:
+            pass
+        try:
+            await get_database_service().update_investigation(
+                workflow_id,
+                status="FAILED",
+                error=str(exc),
+                completed_at=__import__('datetime').datetime.utcnow(),
+            )
+        except Exception:
+            pass
+
+
+@app.get("/api/v1/investigations", response_model=InvestigationListResponse)
+async def list_investigations(
+    supplier_id: Optional[UUID] = None,
+    status: Optional[str] = None,
+    workflow_type: Optional[WorkflowType] = None,
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    db: DatabaseService = Depends(get_db),
+):
+    """List investigations with optional filters (newest first)"""
+    rows, total = await db.list_investigations(
+        supplier_id=supplier_id,
+        status=status,
+        workflow_type=workflow_type.value if workflow_type else None,
+        limit=limit,
+        offset=offset,
+    )
+
+    investigations = [
+        InvestigationSummaryResponse(
+            workflow_id=inv.workflow_id,
+            supplier_id=inv.supplier_id,
+            supplier_name=supplier_name,
+            workflow_type=WorkflowType(inv.workflow_type),
+            status=inv.status,
+            query=inv.query,
+            hitl_required=inv.hitl_required,
+            hitl_status=inv.hitl_status,
+            error=inv.error,
+            step_count=inv.step_count,
+            created_at=inv.created_at,
+            updated_at=inv.updated_at,
+            completed_at=inv.completed_at,
+        )
+        for inv, supplier_name in rows
+    ]
+
+    return InvestigationListResponse(
+        investigations=investigations,
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
 @app.post("/api/v1/investigations", response_model=InvestigationResponseSchema)
 async def start_investigation(
     request: InvestigationRequestSchema,
+    background_tasks: BackgroundTasks,
+    db: DatabaseService = Depends(get_db),
     runner: SentinelWorkflowRunner = Depends(get_workflow_runner)
 ):
-    """Start a new investigation workflow"""
-    
-    if request.workflow_type == WorkflowType.AUTONOMOUS_DISCOVERY:
-        if not request.supplier_id:
-            raise HTTPException(status_code=400, detail="supplier_id required for autonomous discovery")
-        result = await runner.run_autonomous_discovery(request.supplier_id)
-    else:
-        result = await runner.run_deep_dive_investigation(
-            supplier_id=request.supplier_id,
-            supplier_name=request.supplier_name,
-            query=request.query
-        )
-    
-    if isinstance(result, dict):
-        raise HTTPException(status_code=500, detail=result.get("error", "Workflow failed"))
-    
-    # Convert risk factors, mitigations, alternatives from workflow state
-    risk_factors = []
-    mitigation_actions = []
-    alternative_suppliers = []
-    evidence = []
-    
-    if hasattr(result, 'state_data') and result.state_data:
-        # Extract from state_data
-        pass
-    
+    """Start a new investigation workflow.
+
+    The workflow runs in the background; clients receive progress via the
+    SSE stream at `/api/v1/investigations/{workflow_id}/stream`.
+    """
+    if request.workflow_type == WorkflowType.AUTONOMOUS_DISCOVERY and not request.supplier_id:
+        raise HTTPException(status_code=400, detail="supplier_id required for autonomous discovery")
+
+    supplier_id = await _resolve_or_create_supplier(
+        db, request.supplier_id, request.supplier_name, request.query
+    )
+
+    workflow_id = uuid4()
+
+    # Create a RUNNING row up front so the investigation is visible in
+    # listings/metrics while executing (final state is upserted by the runner).
+    await db.create_investigation(
+        workflow_id=workflow_id,
+        supplier_id=supplier_id,
+        workflow_type=request.workflow_type.value,
+        status="RUNNING",
+        query=request.query,
+    )
+
+    background_tasks.add_task(
+        _execute_workflow,
+        runner,
+        request.workflow_type,
+        supplier_id,
+        request.supplier_name,
+        request.query,
+        workflow_id,
+    )
+
     return InvestigationResponseSchema(
-        workflow_id=result.workflow_id,
-        status=result.status,
-        summary=result.state_data.get("summary") if hasattr(result, 'state_data') else None,
-        risk_factors=risk_factors,
-        mitigation_actions=mitigation_actions,
-        alternative_suppliers=alternative_suppliers,
-        evidence=evidence,
-        hitl_required=result.hitl_required,
-        hitl_payload=result.hitl_payload,
-        processing_time_seconds=0.0
+        workflow_id=workflow_id,
+        status="RUNNING",
+        summary=None,
+        risk_factors=[],
+        mitigation_actions=[],
+        alternative_suppliers=[],
+        evidence=[],
+        hitl_required=False,
+        hitl_payload=None,
+        processing_time_seconds=0.0,
     )
 
 
@@ -483,6 +637,40 @@ async def submit_hitl_response(
     return WorkflowStatusResponse(**result.model_dump())
 
 
+# Recent Risk Alerts
+@app.get("/api/v1/alerts/recent", response_model=AlertListResponse)
+async def list_recent_alerts(
+    hours: Optional[int] = Query(None, ge=1, le=720),
+    level: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=200),
+    db: DatabaseService = Depends(get_db),
+):
+    """List recent risk alerts (risk factors), newest first.
+
+    Pass `hours` to restrict to a detection window; omit for all history.
+    """
+    rows = await db.list_recent_risk_factors(hours=hours, level=level, limit=limit)
+
+    alerts = [
+        RiskAlertResponse(
+            id=rf.id,
+            supplier_id=rf.supplier_id,
+            supplier_name=supplier_name,
+            category=str(rf.category),
+            level=str(rf.level),
+            title=rf.title,
+            description=rf.description,
+            confidence=rf.confidence,
+            impact_score=rf.impact_score,
+            likelihood_score=rf.likelihood_score,
+            detected_at=rf.detected_at,
+        )
+        for rf, supplier_name in rows
+    ]
+
+    return AlertListResponse(alerts=alerts, total=len(alerts))
+
+
 # Streaming endpoint for real-time updates
 @app.get("/api/v1/investigations/{workflow_id}/stream")
 async def stream_workflow_updates(workflow_id: UUID):
@@ -503,7 +691,7 @@ async def stream_workflow_updates(workflow_id: UUID):
                     yield f"data: {json.dumps(message)}\n\n"
                     
                     # Check if workflow completed
-                    if message.get("status") in ["COMPLETED", "FAILED", "CANCELLED", "WAITING_HITL"]:
+                    if message.get("status") in ["COMPLETED", "FAILED", "CANCELLED", "ESCALATED", "WAITING_HITL"]:
                         break
                 except asyncio.TimeoutError:
                     # Send heartbeat

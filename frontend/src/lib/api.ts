@@ -1,48 +1,120 @@
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+import axios, { type AxiosRequestConfig } from 'axios'
+import type {
+  AgentStatusMap,
+  AlertListResponse,
+  InvestigationListResponse,
+  InvestigationStartInput,
+  InvestigationStartResponse,
+  Metrics,
+  RiskFactor,
+  Supplier,
+  SupplierCreateInput,
+  SupplierListResponse,
+  WorkflowEvent,
+} from './types'
 
-async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const url = `${API_URL}${path}`
-  const res = await fetch(url, {
-    headers: { 'Content-Type': 'application/json', ...options.headers },
-    ...options,
-  })
-  if (!res.ok) throw new Error(`API error: ${res.status} ${res.statusText}`)
-  if (res.status === 204) return undefined as T
-  return res.json()
+export const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+
+const client = axios.create({
+  baseURL: API_BASE_URL,
+  timeout: 30000,
+  headers: { 'Content-Type': 'application/json' },
+})
+
+client.interceptors.request.use((config) => {
+  if (typeof window !== 'undefined') {
+    const token = window.localStorage.getItem('sc_access_token')
+    if (token) config.headers.Authorization = `Bearer ${token}`
+  }
+  return config
+})
+
+export function getApiErrorMessage(error: unknown): string {
+  if (axios.isAxiosError(error)) {
+    const detail = (error.response?.data as { detail?: unknown } | undefined)?.detail
+    if (typeof detail === 'string') return detail
+    return error.message
+  }
+  return error instanceof Error ? error.message : 'Unknown error'
+}
+
+async function request<T>(path: string, options?: AxiosRequestConfig): Promise<T> {
+  try {
+    const { data } = await client.request<T>({ url: path, ...options })
+    return data
+  } catch (error) {
+    throw new Error(getApiErrorMessage(error))
+  }
 }
 
 // Health
 export const healthCheck = () => request<{ status: string; version: string }>('/health')
-export const getMetrics = () => request<Record<string, unknown>>('/metrics')
-export const getAgentsStatus = () => request<Record<string, unknown>>('/api/v1/agents/status')
+export const getMetrics = () => request<Metrics>('/metrics')
+export const getAgentsStatus = () => request<AgentStatusMap>('/api/v1/agents/status')
 export const getConfig = () => request<Record<string, unknown>>('/api/v1/config')
 
 // Suppliers
-export const listSuppliers = (params?: Record<string, unknown>) => {
-  const qs = params ? '?' + new URLSearchParams(params as Record<string, string>).toString() : ''
-  return request<{ suppliers: any[]; total: number }>(`/api/v1/suppliers${qs}`)
+export function listSuppliers(params?: {
+  query?: string
+  tier?: string
+  country?: string
+  industry?: string
+  is_active?: boolean
+  limit?: number
+  offset?: number
+}) {
+  return request<SupplierListResponse>('/api/v1/suppliers', { params })
 }
-export const getSupplier = (id: string) => request<any>(`/api/v1/suppliers/${id}`)
-export const createSupplier = (data: any) => request<any>('/api/v1/suppliers', { method: 'POST', body: JSON.stringify(data) })
-export const updateSupplier = (id: string, data: any) => request<any>(`/api/v1/suppliers/${id}`, { method: 'PATCH', body: JSON.stringify(data) })
-export const deleteSupplier = (id: string) => request<void>(`/api/v1/suppliers/${id}`, { method: 'DELETE' })
+export const getSupplier = (id: string) => request<Supplier>(`/api/v1/suppliers/${id}`)
+export const createSupplier = (data: SupplierCreateInput) =>
+  request<Supplier>('/api/v1/suppliers', { method: 'POST', data })
+export const updateSupplier = (id: string, data: Partial<SupplierCreateInput>) =>
+  request<Supplier>(`/api/v1/suppliers/${id}`, { method: 'PATCH', data })
+export const deleteSupplier = (id: string) =>
+  request<void>(`/api/v1/suppliers/${id}`, { method: 'DELETE' })
+
+// Risk factors
+export const listSupplierRiskFactors = (supplierId: string) =>
+  request<RiskFactor[]>(`/api/v1/suppliers/${supplierId}/risk-factors`)
 
 // Investigations
-export const startInvestigation = (data: any) => request<any>('/api/v1/investigations', { method: 'POST', body: JSON.stringify(data) })
-export const getWorkflowStatus = (id: string) => request<any>(`/api/v1/investigations/${id}`)
-export const submitHitlResponse = (id: string, data: any) => request<any>(`/api/v1/investigations/${id}/hitl`, { method: 'POST', body: JSON.stringify(data) })
+export const startInvestigation = (data: InvestigationStartInput) =>
+  request<InvestigationStartResponse>('/api/v1/investigations', { method: 'POST', data })
+export const listInvestigations = (params?: {
+  supplier_id?: string
+  status?: string
+  workflow_type?: string
+  limit?: number
+  offset?: number
+}) => request<InvestigationListResponse>('/api/v1/investigations', { params })
+export const submitHitlResponse = (
+  workflowId: string,
+  data: { workflow_id: string; action: 'APPROVE' | 'DENY' | 'ESCALATE'; comment?: string },
+) => request<unknown>(`/api/v1/investigations/${workflowId}/hitl`, { method: 'POST', data })
+
+// Alerts
+export function listRecentAlerts(params?: { hours?: number; level?: string; limit?: number }) {
+  return request<AlertListResponse>('/api/v1/alerts/recent', { params })
+}
 
 // SSE Streaming
-export function streamWorkflowUpdates(workflowId: string, onMessage: (data: any) => void, onError?: (err: Event) => void, onComplete?: () => void): EventSource {
-  const url = `${API_URL}/api/v1/investigations/${workflowId}/stream`
+export function streamWorkflowUpdates(
+  workflowId: string,
+  onMessage: (event: WorkflowEvent | { type: 'heartbeat' }) => void,
+  onError?: (err: Event) => void,
+): EventSource {
+  const url = `${API_BASE_URL}/api/v1/investigations/${workflowId}/stream`
   const es = new EventSource(url)
   es.onmessage = (event) => {
-    try { onMessage(JSON.parse(event.data)) } catch { onMessage(event.data) }
+    try {
+      onMessage(JSON.parse(event.data))
+    } catch {
+      // Ignore malformed frames
+    }
   }
   es.onerror = (err) => {
     onError?.(err)
     es.close()
   }
-  es.addEventListener('done', () => { onComplete?.(); es.close() })
   return es
 }

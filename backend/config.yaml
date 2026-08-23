@@ -7,6 +7,11 @@ app:
   host: "0.0.0.0"
   port: 8000
 
+# Allowed CORS origins (frontend dev server / production origins)
+cors_origins:
+  - "http://localhost:3000"
+  - "http://127.0.0.1:3000"
+
 # LLM Configuration
 llm:
   primary:
@@ -34,8 +39,11 @@ langgraph:
   checkpoint_interval: 5
   state_ttl: 3600
 
-# CrewAI Configuration
+# CrewAI Configuration (deep-dive engine; requires Python >=3.11,<3.13)
+# When enabled, deep-dive investigations run via the CrewAI crew with an
+# automatic fallback to the LangGraph pipeline on failure.
 crewai:
+  enabled: false
   verbose: true
   max_iter: 10
   max_rpm: 100

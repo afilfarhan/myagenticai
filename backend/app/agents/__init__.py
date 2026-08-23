@@ -887,7 +887,20 @@ class OrchestratorAgent(BaseAgent):
     
     async def process(self, context: AgentContext) -> AgentResult:
         return AgentResult(success=True, context=context, messages=["Orchestrator coordinating workflow"])
-    
+
+    async def run_deep_dive_crew(self, supplier_id=None, supplier_name=None, query=""):
+        """Delegate a deep-dive investigation to the CrewAI engine."""
+        import uuid as _uuid
+
+        from app.crews import DeepDiveCrew
+
+        crew = DeepDiveCrew(
+            workflow_id=_uuid.uuid4(),
+            supplier_name=supplier_name,
+            query=query,
+        )
+        return await crew.run()
+
     async def run_workflow(self, context: AgentContext) -> AgentContext:
         """Run the complete agent workflow"""
         current_agent_role = AgentRole.SCOUT

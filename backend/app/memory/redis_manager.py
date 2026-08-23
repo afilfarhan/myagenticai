@@ -3,7 +3,7 @@ Redis Manager for SentinelChain - Session state, caching, pub/sub, rate limiting
 """
 import json
 import asyncio
-from typing import Optional, Any, Dict, List
+from typing import Optional, Any, Dict, List, Tuple
 from datetime import datetime, timedelta
 import structlog
 
