@@ -3,7 +3,6 @@ LLM Gateway Service for SentinelChain - LiteLLM-based provider failover
 """
 import os
 import json
-import asyncio
 import structlog
 from typing import Optional, Dict, Any, List, AsyncGenerator
 from dataclasses import dataclass
@@ -100,26 +99,48 @@ class LLMGateway:
         """Register callback for cost tracking"""
         self.cost_callbacks.append(callback)
     
-    async def _track_cost(self, response, model: str, provider_role: ProviderRole):
+    def _compute_cost(self, response, model: str,
+                      input_tokens: int, output_tokens: int) -> float:
+        """Best-effort USD cost for one completion.
+
+        1. LiteLLM pricing via ``completion_response`` (works across versions).
+        2. Static per-million-token price table from config
+           (``cost_control.model_prices: {"<model>": {"input": x, "output": y}}``).
+        3. Zero when neither is available - tracking must never break calls.
+        """
+        try:
+            return float(litellm.completion_cost(completion_response=response, model=model))
+        except Exception:
+            pass
+
+        prices = (get_config().cost_control.model_prices or {}) if hasattr(
+            get_config().cost_control, "model_prices") else {}
+        entry = prices.get(model) or {}
+        try:
+            return (
+                input_tokens / 1_000_000 * float(entry.get("input", 0))
+                + output_tokens / 1_000_000 * float(entry.get("output", 0))
+            )
+        except Exception:
+            return 0.0
+
+    async def _track_cost(self, response, model: str, provider_role: ProviderRole,
+                          metadata: Optional[Dict[str, Any]] = None):
         """Extract and track token usage/cost from response"""
         try:
             input_tokens = response.usage.prompt_tokens if response.usage else 0
             output_tokens = response.usage.completion_tokens if response.usage else 0
-            
-            # Calculate cost using LiteLLM's pricing
-            cost = litellm.completion_cost(
-                model=model,
-                prompt_tokens=input_tokens,
-                completion_tokens=output_tokens
-            )
-            
+
+            cost = self._compute_cost(response, model, input_tokens, output_tokens)
+
             for callback in self.cost_callbacks:
                 await callback(
                     model=model,
                     provider=provider_role.value,
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
-                    cost_usd=cost
+                    cost_usd=cost,
+                    metadata=metadata or {},
                 )
         except Exception as e:
             logger.warning("Cost tracking failed", error=str(e))
@@ -177,8 +198,8 @@ class LLMGateway:
                 
                 if stream:
                     return self._wrap_stream(response, provider.model, current_role, metadata)
-                
-                await self._track_cost(response, provider.model, current_role)
+
+                await self._track_cost(response, provider.model, current_role, metadata)
                 logger.info("LLM completion success", 
                            model=provider.model, 
                            role=current_role.value,
@@ -243,14 +264,16 @@ class LLMGateway:
             
             # Final cost tracking
             if input_tokens or output_tokens:
-                cost = litellm.completion_cost(model=model, prompt_tokens=input_tokens, completion_tokens=output_tokens)
+                cost = self._compute_cost(response=None, model=model,
+                                          input_tokens=input_tokens, output_tokens=output_tokens)
                 for callback in self.cost_callbacks:
                     await callback(
                         model=model,
                         provider=role.value,
                         input_tokens=input_tokens,
                         output_tokens=output_tokens,
-                        cost_usd=cost
+                        cost_usd=cost,
+                        metadata=metadata or {},
                     )
         
         return tracked_stream()

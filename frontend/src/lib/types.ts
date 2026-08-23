@@ -53,6 +53,21 @@ export interface SupplierCreateInput {
   contact_phone?: string
 }
 
+export interface SupplierUpdateInput {
+  name?: string
+  legal_name?: string
+  tier?: SupplierTier
+  country?: string
+  region?: string
+  industry?: string
+  website?: string
+  contact_email?: string
+  contact_phone?: string
+  risk_score?: number
+  is_active?: boolean
+  metadata?: Record<string, unknown>
+}
+
 export interface Metrics {
   total_suppliers: number
   active_workflows: number

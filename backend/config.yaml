@@ -126,6 +126,17 @@ cost_control:
     max_entries: 10000
   monthly_budget_usd: 1000
   cost_per_supplier_target: 0.50
+  # Fallback pricing (USD per 1M tokens) used when LiteLLM pricing lookup fails
+  model_prices:
+    "claude-3-5-sonnet-20241022":
+      input: 3.0
+      output: 15.0
+    "gpt-4o":
+      input: 2.5
+      output: 10.0
+    "meta.llama3-1-70b-instruct-v1:0":
+      input: 0.72
+      output: 0.72
 
 # HITL Configuration
 hitl:

@@ -445,9 +445,129 @@ class SentinelWorkflowRunner:
 
         if isinstance(result, GraphState):
             await self.memory.save_workflow_state(result)
+            await self._persist_langgraph_findings(result)
             await self._publish_terminal_event(result)
 
         return result
+
+    async def _persist_langgraph_findings(self, state: GraphState) -> None:
+        """Persist structured findings (evidence, risks, mitigations,
+        alternatives) produced by the LangGraph pipeline.
+
+        Mirrors ``_persist_crew_risk_factors`` so both engines feed the same
+        database-backed surfaces (alerts feed, supplier detail, metrics).
+        """
+        try:
+            investigation = await self.memory.db.get_investigation(state.workflow_id)
+            if not (investigation and state.supplier_id):
+                return
+
+            context = state.agent_context
+            evidence_items = list(getattr(context, "evidence", []) or []) if context else []
+            risk_factors = [
+                rf for rf in (state.risk_factors_identified or [])
+                if isinstance(rf, RiskFactor)
+            ]
+            mitigation_actions = list(getattr(context, "mitigation_actions", []) or []) if context else []
+            alternative_suppliers = list(getattr(context, "alternative_suppliers", []) or []) if context else []
+
+            # --- Evidence ---
+            evidence_id_map: Dict[str, Any] = {}
+            for ev in evidence_items[:50]:
+                try:
+                    row = await self.memory.db.add_evidence(
+                        supplier_id=state.supplier_id,
+                        investigation_id=investigation.id,
+                        type=ev.type.value,
+                        source=str(ev.source)[:500],
+                        title=str(ev.title)[:500],
+                        content=ev.content,
+                        url=ev.url,
+                        credibility_score=ev.credibility_score,
+                        relevance_score=ev.relevance_score,
+                        evidence_metadata=ev.metadata or {},
+                    )
+                    evidence_id_map[str(ev.id)] = row.id
+                except Exception as exc:
+                    self.logger.warning("Failed to persist evidence item",
+                                        workflow_id=str(state.workflow_id), error=str(exc))
+
+            # --- Risk factors ---
+            factor_row_ids: Dict[str, Any] = {}
+            for rf in risk_factors[:20]:
+                try:
+                    row = await self.memory.db.add_risk_factor(
+                        supplier_id=state.supplier_id,
+                        investigation_id=investigation.id,
+                        category=rf.category.value,
+                        level=rf.level.value,
+                        title=str(rf.title)[:255],
+                        description=rf.description,
+                        evidence_ids=[
+                            str(evidence_id_map.get(str(eid), eid))
+                            for eid in (rf.evidence_ids or [])
+                        ],
+                        confidence=rf.confidence,
+                        impact_score=rf.impact_score,
+                        likelihood_score=rf.likelihood_score,
+                        risk_metadata={**(rf.metadata or {}), "engine": "langgraph"},
+                    )
+                    factor_row_ids[str(rf.id)] = row.id
+                except Exception as exc:
+                    self.logger.warning("Failed to persist risk factor",
+                                        workflow_id=str(state.workflow_id), error=str(exc))
+
+            # --- Mitigation actions (require an existing risk_factor FK) ---
+            default_factor_id = next(iter(factor_row_ids.values()), None)
+            for ma in mitigation_actions[:20]:
+                target_factor = factor_row_ids.get(str(getattr(ma, "risk_factor_id", "")), default_factor_id)
+                if not target_factor:
+                    break
+                try:
+                    await self.memory.db.add_mitigation_action(
+                        risk_factor_id=target_factor,
+                        investigation_id=investigation.id,
+                        title=str(ma.title)[:255],
+                        description=ma.description,
+                        action_type=str(ma.action_type),
+                        estimated_cost=ma.estimated_cost,
+                        estimated_timeline_days=ma.estimated_timeline_days,
+                        priority=ma.priority,
+                        status="PROPOSED",
+                        action_metadata=ma.metadata or {},
+                    )
+                except Exception as exc:
+                    self.logger.warning("Failed to persist mitigation action",
+                                        workflow_id=str(state.workflow_id), error=str(exc))
+
+            # --- Alternative suppliers ---
+            for alt in alternative_suppliers[:10]:
+                try:
+                    await self.memory.db.add_alternative_supplier(
+                        original_supplier_id=state.supplier_id,
+                        investigation_id=investigation.id,
+                        name=str(alt.name)[:255],
+                        country=str(alt.country)[:100],
+                        risk_score=alt.risk_score,
+                        cost_difference_pct=alt.cost_difference_pct,
+                        lead_time_days=alt.lead_time_days,
+                        quality_rating=alt.quality_rating,
+                        certifications=alt.certifications or [],
+                        alt_metadata=alt.metadata or {},
+                    )
+                except Exception as exc:
+                    self.logger.warning("Failed to persist alternative supplier",
+                                        workflow_id=str(state.workflow_id), error=str(exc))
+
+            persisted = len(evidence_id_map) + len(factor_row_ids)
+            if persisted:
+                self.logger.info("LangGraph findings persisted",
+                                 workflow_id=str(state.workflow_id),
+                                 evidence=len(evidence_id_map),
+                                 risk_factors=len(factor_row_ids))
+        except Exception as exc:
+            self.logger.warning("Failed to persist LangGraph findings",
+                                workflow_id=str(state.workflow_id), error=str(exc))
 
     async def _publish_terminal_event(self, state: GraphState) -> None:
         """Publish the terminal workflow event so SSE clients stop listening."""

@@ -423,15 +423,19 @@ class DatabaseService:
             return result.scalar_one_or_none()
     
     async def update_investigation(self, workflow_id: UUID, **kwargs) -> Optional[InvestigationDB]:
+        from sqlalchemy import select
         async with self._factory() as session:
-            investigation = await self.get_investigation(workflow_id)
+            result = await session.execute(
+                select(InvestigationDB).where(InvestigationDB.workflow_id == workflow_id)
+            )
+            investigation = result.scalar_one_or_none()
             if not investigation:
                 return None
-            
+
             for key, value in kwargs.items():
                 if hasattr(investigation, key):
                     setattr(investigation, key, value)
-            
+
             investigation.updated_at = datetime.utcnow()
             await session.commit()
             await session.refresh(investigation)
@@ -549,6 +553,28 @@ class DatabaseService:
                 .order_by(RiskFactorDB.detected_at.desc())
             )
             return list(result.scalars().all())
+
+    async def get_false_positive_rate(self) -> float:
+        """Share of decided HITL escalations that were denied by a human.
+
+        Used as an operational proxy for the false-positive rate of risk
+        findings; returns 0.0 while no decisions exist.
+        """
+        from sqlalchemy import select, func
+        async with self._factory() as session:
+            decided = await session.scalar(
+                select(func.count())
+                .select_from(InvestigationDB)
+                .where(InvestigationDB.hitl_status.in_(["APPROVED", "DENIED", "ESCALATED"]))
+            ) or 0
+            if not decided:
+                return 0.0
+            denied = await session.scalar(
+                select(func.count())
+                .select_from(InvestigationDB)
+                .where(InvestigationDB.hitl_status == "DENIED")
+            ) or 0
+            return round(int(denied) / int(decided), 4)
 
     async def get_dashboard_metrics(self) -> dict:
         """Aggregate dashboard metrics in a single round trip."""

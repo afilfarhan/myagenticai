@@ -1,6 +1,7 @@
 """
 Memory Manager for SentinelChain - Coordinates database, vector store, Redis, and embeddings
 """
+import asyncio
 import hashlib
 from typing import Optional, List, Dict, Any, Tuple
 from uuid import UUID
@@ -8,12 +9,14 @@ import structlog
 
 from app.models import (
     Supplier, Evidence, RiskFactor, WorkflowState, AgentMessage,
-    WorkflowType, HITLStatus, RiskLevel, RiskCategory, EvidenceType, SupplierTier
+    WorkflowType, HITLStatus,
+    RiskLevel, RiskCategory, EvidenceType, SupplierTier,  # noqa: F401 (re-exported)
 )
 from app.services.database import DatabaseService, get_database_service
 from app.memory.redis_manager import RedisManager, get_redis_manager
 from app.memory.vector_store import VectorStore, get_vector_store
-from app.services.embeddings import EmbeddingService, get_embedding_service, MockEmbeddingService
+from app.services.embeddings import EmbeddingService, MockEmbeddingService
+from app.services.embeddings import get_embedding_service  # noqa: F401 (re-exported)
 
 logger = structlog.get_logger(__name__)
 
@@ -77,6 +80,39 @@ class MemoryManager:
         if self.redis:
             await self.redis.close()
         self._initialized = False
+
+    def get_status(self) -> Dict[str, str]:
+        """Report the active backend of each memory layer.
+
+        Surfaces degraded modes (in-memory fallback, mock vector store) so
+        operators can see when optional infrastructure is missing instead of
+        silently running on substitutes.
+        """
+        if self.redis:
+            cache = "redis" if self.redis.is_connected() else "in-memory-fallback"
+        else:
+            cache = "unavailable"
+
+        if self.vector_store:
+            vectors = "mock" if getattr(self.vector_store, "_use_mock", False) else "pinecone"
+        else:
+            vectors = "unavailable"
+
+        if self.embeddings is None:
+            embeddings = "unavailable"
+        elif isinstance(self.embeddings, MockEmbeddingService):
+            embeddings = "mock"
+        else:
+            embeddings = str(
+                getattr(self.embeddings, "provider", None)
+                or getattr(self.embeddings, "model_name", "configured")
+            )
+
+        return {
+            "memory_cache": cache,
+            "vector_store": vectors,
+            "embeddings": embeddings,
+        }
     
     # --- Text preparation helpers ---
     
@@ -493,7 +529,6 @@ class MemoryManager:
     
     async def subscribe_agent(self, agent_role: str) -> "asyncio.Queue":
         """Subscribe to agent channel"""
-        import asyncio
         channel = f"agent:{agent_role}"
         return await self.redis.subscribe(channel)
     

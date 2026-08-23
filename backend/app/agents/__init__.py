@@ -93,7 +93,7 @@ class BaseAgent(ABC):
         if self.embeddings is None:
             self.embeddings = await get_embedding_service()
         if self.llm_gateway is None:
-            self.llm_gateway = await get_llm_gateway()
+            self.llm_gateway = get_llm_gateway()
     
     @abstractmethod
     async def process(self, context: AgentContext) -> AgentResult:

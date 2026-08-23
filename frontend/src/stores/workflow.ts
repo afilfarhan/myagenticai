@@ -1,9 +1,11 @@
 import { create } from 'zustand'
 import {
+  connectWorkflowSocket,
   getApiErrorMessage,
   startInvestigation,
   streamWorkflowUpdates,
   submitHitlResponse,
+  type StreamHandle,
 } from '@/lib/api'
 import type { HitlPayload, WorkflowEvent, WorkflowType } from '@/lib/types'
 
@@ -22,49 +24,67 @@ interface WorkflowStoreState {
   hitlPayload: HitlPayload | null
   summary: string | null
   error: string | null
+  transport: 'websocket' | 'sse' | null
   start: (input: { query: string; supplierName?: string; workflowType: WorkflowType }) => Promise<void>
   resumeHitl: (action: 'APPROVE' | 'DENY' | 'ESCALATE') => Promise<void>
   reset: () => void
 }
 
-let eventSource: EventSource | null = null
+let streamHandle: StreamHandle | null = null
 
 function closeStream() {
-  eventSource?.close()
-  eventSource = null
+  streamHandle?.close()
+  streamHandle = null
 }
 
 export const useWorkflowStore = create<WorkflowStoreState>((set, get) => {
+  function processEvent(step: WorkflowEvent) {
+    set((s) => ({ steps: [...s.steps, step] }))
+
+    if (step.hitl_required && step.status !== 'COMPLETED') {
+      set({ phase: 'hitl_required', hitlPayload: step.hitl_payload ?? get().hitlPayload })
+      return
+    }
+    if (step.status === 'COMPLETED') {
+      set({ phase: 'completed', summary: step.summary ?? null })
+      closeStream()
+    } else if (step.status === 'FAILED' || step.status === 'CANCELLED') {
+      set({ phase: 'failed', error: step.message || 'Workflow failed' })
+      closeStream()
+    }
+  }
+
+  /**
+   * Prefer the WebSocket transport; if it fails before delivering any event
+   * (e.g. proxies without WS support), silently fall back to SSE.
+   */
   function connectStream(workflowId: string) {
     closeStream()
-    eventSource = streamWorkflowUpdates(
-      workflowId,
-      (event) => {
-        if ('type' in event && event.type === 'heartbeat') return
-        const step = event as WorkflowEvent
-        set((s) => ({ steps: [...s.steps, step] }))
+    let received = 0
+    let fellBack = false
 
-        if (step.hitl_required && step.status !== 'COMPLETED') {
-          set({ phase: 'hitl_required', hitlPayload: step.hitl_payload ?? get().hitlPayload })
-          return
-        }
-        if (step.status === 'COMPLETED') {
-          set({ phase: 'completed', summary: step.summary ?? null })
-          closeStream()
-        } else if (step.status === 'FAILED' || step.status === 'CANCELLED') {
-          set({ phase: 'failed', error: step.message || 'Workflow failed' })
-          closeStream()
-        }
-      },
-      () => {
-        // Server closed the stream (e.g. after WAITING_HITL). Only surface an
-        // error if the workflow is still considered in-flight.
-        const phase = get().phase
-        if (phase === 'streaming') {
-          set({ phase: 'failed', error: 'Stream connection lost' })
-        }
-      },
-    )
+    const onEvent = (event: WorkflowEvent | { type: 'heartbeat' }) => {
+      if ('type' in event && event.type === 'heartbeat') return
+      received += 1
+      set({ transport: fellBack ? 'sse' : 'websocket' })
+      processEvent(event as WorkflowEvent)
+    }
+
+    const onWsDead = () => {
+      if (received === 0 && !fellBack && get().workflowId === workflowId) {
+        fellBack = true
+        streamHandle?.close()
+        streamHandle = streamWorkflowUpdates(workflowId, onEvent, () => {
+          // Server closed the stream (e.g. after WAITING_HITL). Only surface
+          // an error if the workflow is still considered in-flight.
+          if (get().phase === 'streaming') {
+            set({ phase: 'failed', error: 'Stream connection lost' })
+          }
+        })
+      }
+    }
+
+    streamHandle = connectWorkflowSocket(workflowId, onEvent, onWsDead)
   }
 
   return {
@@ -74,6 +94,7 @@ export const useWorkflowStore = create<WorkflowStoreState>((set, get) => {
     hitlPayload: null,
     summary: null,
     error: null,
+    transport: null,
 
     start: async ({ query, supplierName, workflowType }) => {
       closeStream()
@@ -84,6 +105,7 @@ export const useWorkflowStore = create<WorkflowStoreState>((set, get) => {
         summary: null,
         error: null,
         workflowId: null,
+        transport: null,
       })
 
       try {
@@ -120,6 +142,7 @@ export const useWorkflowStore = create<WorkflowStoreState>((set, get) => {
         hitlPayload: null,
         summary: null,
         error: null,
+        transport: null,
       })
     },
   }

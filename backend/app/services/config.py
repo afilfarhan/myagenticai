@@ -16,6 +16,8 @@ class LLMConfig(BaseSettings):
     provider: str = Field(default="anthropic")
     model: str = Field(default="claude-3-5-sonnet-20241022")
     api_key: Optional[str] = Field(default=None)
+    api_base: Optional[str] = Field(default=None)
+    region: Optional[str] = Field(default=None)
     temperature: float = Field(default=0.1)
     max_tokens: int = Field(default=8192)
 
@@ -55,6 +57,9 @@ class CostControlConfig(BaseSettings):
     semantic_cache: Dict[str, Any] = Field(default_factory=dict)
     monthly_budget_usd: float = Field(default=1000.0)
     cost_per_supplier_target: float = Field(default=0.50)
+    # Fallback pricing (USD per 1M tokens) when LiteLLM pricing is unavailable:
+    # model_prices: {"<model>": {"input": 3.0, "output": 15.0}}
+    model_prices: Dict[str, Any] = Field(default_factory=dict)
 
 
 class HITLConfig(BaseSettings):
@@ -98,6 +103,14 @@ class Settings(BaseSettings):
     host: str = Field(default="0.0.0.0")
     port: int = Field(default=8000)
     cors_origins: List[str] = Field(default_factory=lambda: ["http://localhost:3000"])
+
+    @field_validator("cors_origins", mode="before")
+    @classmethod
+    def parse_cors_origins(cls, v):
+        """Accept a comma-separated string via env (CORS_ORIGINS=http://a,http://b)."""
+        if isinstance(v, str):
+            return [origin.strip() for origin in v.split(",") if origin.strip()]
+        return v
     
     # Sub-configurations
     llm: LLMSettings = Field(default_factory=LLMSettings)

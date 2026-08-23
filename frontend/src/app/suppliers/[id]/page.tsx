@@ -1,12 +1,15 @@
 'use client'
 
+import { useState } from 'react'
 import Link from 'next/link'
 import { useParams } from 'next/navigation'
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { formatDistanceToNow } from 'date-fns'
-import { Building2, Globe, Mail, MapPin } from 'lucide-react'
+import { toast } from 'sonner'
+import { Building2, Globe, Mail, MapPin, Pencil, X } from 'lucide-react'
 import { AppHeader, RiskBadge } from '@/components/app-header'
-import { getSupplier, listInvestigations, listSupplierRiskFactors } from '@/lib/api'
+import { getSupplier, listInvestigations, listSupplierRiskFactors, updateSupplier } from '@/lib/api'
+import type { Supplier, SupplierTier, SupplierUpdateInput } from '@/lib/types'
 import { cn } from '@/lib/utils'
 
 const tierLabels: Record<string, string> = {
@@ -15,6 +18,8 @@ const tierLabels: Record<string, string> = {
   TIER_3: 'Tier 3',
   UNKNOWN: 'Unknown',
 }
+
+const tierOptions: SupplierTier[] = ['TIER_1', 'TIER_2', 'TIER_3', 'UNKNOWN']
 
 function riskColor(score: number) {
   if (score >= 70) return 'text-red-600'
@@ -26,11 +31,34 @@ function riskColor(score: number) {
 export default function SupplierDetailPage() {
   const params = useParams<{ id: string }>()
   const id = params.id
+  const queryClient = useQueryClient()
+  const [showEdit, setShowEdit] = useState(false)
 
   const { data: supplier, isLoading, isError, error } = useQuery({
     queryKey: ['supplier', id],
     queryFn: () => getSupplier(id),
     retry: false,
+  })
+
+  const updateMutation = useMutation({
+    mutationFn: (input: SupplierUpdateInput) => updateSupplier(id, input),
+    onSuccess: () => {
+      toast.success('Supplier updated')
+      setShowEdit(false)
+      queryClient.invalidateQueries({ queryKey: ['supplier', id] })
+      queryClient.invalidateQueries({ queryKey: ['suppliers'] })
+    },
+    onError: (err) => toast.error(err.message),
+  })
+
+  const toggleActiveMutation = useMutation({
+    mutationFn: () => updateSupplier(id, { is_active: !supplier?.is_active }),
+    onSuccess: (updated) => {
+      toast.success(updated.is_active ? 'Supplier activated' : 'Supplier deactivated')
+      queryClient.invalidateQueries({ queryKey: ['supplier', id] })
+      queryClient.invalidateQueries({ queryKey: ['suppliers'] })
+    },
+    onError: (err) => toast.error(err.message),
   })
   const { data: riskFactors } = useQuery({
     queryKey: ['supplier', id, 'risk-factors'],
@@ -101,6 +129,19 @@ export default function SupplierDetailPage() {
                 >
                   Investigate this supplier
                 </Link>
+                <button
+                  onClick={() => setShowEdit(true)}
+                  className="inline-flex items-center gap-1.5 border border-gray-300 text-gray-700 px-4 py-2 rounded-lg text-sm hover:bg-gray-50 transition-colors"
+                >
+                  <Pencil className="w-3.5 h-3.5" /> Edit
+                </button>
+                <button
+                  disabled={toggleActiveMutation.isPending}
+                  onClick={() => toggleActiveMutation.mutate()}
+                  className="border border-gray-300 text-gray-700 px-4 py-2 rounded-lg text-sm hover:bg-gray-50 disabled:opacity-50 transition-colors"
+                >
+                  {supplier.is_active ? 'Deactivate' : 'Activate'}
+                </button>
               </div>
             </div>
 
@@ -166,6 +207,15 @@ export default function SupplierDetailPage() {
           </>
         )}
       </main>
+
+      {showEdit && supplier && (
+        <EditSupplierModal
+          supplier={supplier}
+          submitting={updateMutation.isPending}
+          onClose={() => setShowEdit(false)}
+          onSubmit={(input) => updateMutation.mutate(input)}
+        />
+      )}
     </div>
   )
 }
@@ -183,5 +233,129 @@ function StatusPill({ status }: { status: string }) {
     <span className={cn('text-xs font-medium rounded-full px-2 py-0.5', colors[status] || 'bg-gray-100 text-gray-600')}>
       {status.replace(/_/g, ' ')}
     </span>
+  )
+}
+
+function EditSupplierModal({
+  supplier,
+  submitting,
+  onClose,
+  onSubmit,
+}: {
+  supplier: Supplier
+  submitting: boolean
+  onClose: () => void
+  onSubmit: (input: {
+    name: string
+    country: string
+    tier: SupplierTier
+    industry?: string
+    website?: string
+    contact_email?: string
+    contact_phone?: string
+    risk_score?: number
+  }) => void
+}) {
+  const [name, setName] = useState(supplier.name)
+  const [country, setCountry] = useState(supplier.country === 'UNKNOWN' ? '' : supplier.country)
+  const [tier, setTier] = useState<SupplierTier>(supplier.tier)
+  const [industry, setIndustry] = useState(supplier.industry ?? '')
+  const [website, setWebsite] = useState(supplier.website ?? '')
+  const [email, setEmail] = useState(supplier.contact_email ?? '')
+  const [phone, setPhone] = useState(supplier.contact_phone ?? '')
+  const [riskScore, setRiskScore] = useState(String(supplier.risk_score))
+
+  const valid = name.trim().length > 0 && country.trim().length === 2
+
+  const field =
+    'w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary-500'
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={onClose}>
+      <div
+        className="bg-white rounded-xl shadow-xl w-full max-w-lg p-6 space-y-4 max-h-[90vh] overflow-y-auto"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between">
+          <h2 className="font-semibold text-gray-900">Edit Supplier</h2>
+          <button onClick={onClose} aria-label="Close" className="text-gray-400 hover:text-gray-600">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+        <div className="grid grid-cols-2 gap-4">
+          <div className="col-span-2">
+            <label className="block text-sm font-medium text-gray-700 mb-1">Name *</label>
+            <input value={name} onChange={(e) => setName(e.target.value)} className={field} />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Country code *</label>
+            <input
+              value={country}
+              onChange={(e) => setCountry(e.target.value.toUpperCase())}
+              maxLength={2}
+              placeholder="UNKNOWN"
+              className={cn(field, 'uppercase')}
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Tier</label>
+            <select value={tier} onChange={(e) => setTier(e.target.value as SupplierTier)} className={cn(field, 'bg-white')}>
+              {tierOptions.map((t) => (
+                <option key={t} value={t}>{t}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Risk score (0–100)</label>
+            <input
+              type="number"
+              min={0}
+              max={100}
+              step={0.1}
+              value={riskScore}
+              onChange={(e) => setRiskScore(e.target.value)}
+              className={field}
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Industry</label>
+            <input value={industry} onChange={(e) => setIndustry(e.target.value)} className={field} />
+          </div>
+          <div className="col-span-2">
+            <label className="block text-sm font-medium text-gray-700 mb-1">Website</label>
+            <input value={website} onChange={(e) => setWebsite(e.target.value)} placeholder="https://..." className={field} />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Contact email</label>
+            <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} className={field} />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Contact phone</label>
+            <input value={phone} onChange={(e) => setPhone(e.target.value)} className={field} />
+          </div>
+        </div>
+        <div className="flex justify-end gap-3 pt-2">
+          <button onClick={onClose} className="px-4 py-2 text-sm text-gray-600 hover:text-gray-900">Cancel</button>
+          <button
+            disabled={!valid || submitting}
+            onClick={() =>
+              onSubmit({
+                name: name.trim(),
+                country: country.trim() || 'UNKNOWN',
+                tier,
+                industry: industry.trim() || undefined,
+                website: website.trim() || undefined,
+                contact_email: email.trim() || undefined,
+                contact_phone: phone.trim() || undefined,
+                risk_score: riskScore === '' ? undefined : Number(riskScore),
+              })
+            }
+            className="inline-flex items-center gap-2 bg-primary-600 text-white px-4 py-2 rounded-lg text-sm hover:bg-primary-700 disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            Save Changes
+          </button>
+        </div>
+      </div>
+    </div>
   )
 }

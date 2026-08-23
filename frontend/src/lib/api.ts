@@ -10,6 +10,7 @@ import type {
   Supplier,
   SupplierCreateInput,
   SupplierListResponse,
+  SupplierUpdateInput,
   WorkflowEvent,
 } from './types'
 
@@ -68,7 +69,7 @@ export function listSuppliers(params?: {
 export const getSupplier = (id: string) => request<Supplier>(`/api/v1/suppliers/${id}`)
 export const createSupplier = (data: SupplierCreateInput) =>
   request<Supplier>('/api/v1/suppliers', { method: 'POST', data })
-export const updateSupplier = (id: string, data: Partial<SupplierCreateInput>) =>
+export const updateSupplier = (id: string, data: SupplierUpdateInput) =>
   request<Supplier>(`/api/v1/suppliers/${id}`, { method: 'PATCH', data })
 export const deleteSupplier = (id: string) =>
   request<void>(`/api/v1/suppliers/${id}`, { method: 'DELETE' })
@@ -117,4 +118,39 @@ export function streamWorkflowUpdates(
     es.close()
   }
   return es
+}
+
+// WebSocket Streaming (preferred transport; SSE is the fallback)
+export interface StreamHandle {
+  close: () => void
+}
+
+export function connectWorkflowSocket(
+  workflowId: string,
+  onMessage: (event: WorkflowEvent | { type: 'heartbeat' }) => void,
+  onError?: () => void,
+): StreamHandle {
+  const url = `${API_BASE_URL.replace(/^http/, 'ws')}/api/v1/investigations/${workflowId}/ws`
+  let ws: WebSocket | null = null
+  try {
+    ws = new WebSocket(url)
+  } catch {
+    onError?.()
+    return { close: () => undefined }
+  }
+  ws.onmessage = (event) => {
+    try {
+      onMessage(JSON.parse(event.data))
+    } catch {
+      // Ignore malformed frames
+    }
+  }
+  ws.onerror = () => onError?.()
+  return {
+    close: () => {
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+        ws.close()
+      }
+    },
+  }
 }
