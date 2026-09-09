@@ -397,85 +397,81 @@ class AnalystAgent(BaseAgent):
         )
     
     async def _analyze_evidence(self, context: AgentContext) -> List[RiskFactor]:
-        """Analyze evidence and identify risk factors using LLM"""
-        await self._initialize_services()
-        
-        # Prepare evidence summary for LLM
-        evidence_summary = self._prepare_evidence_summary(context.evidence)
-        supplier_name = context.supplier.name if context.supplier else "Unknown"
-        
-        # Build prompt
-        prompt = f"""You are the Analyst agent in SentinelChain, a supply chain risk analysis system.
+            """Analyze evidence and identify risk factors using LLM via gateway"""
+            await self._initialize_services()
 
-Your task: analyze the following evidence about supplier "{supplier_name}" and identify risk factors.
+            # Prepare evidence summary for LLM
+            evidence_summary = self._prepare_evidence_summary(context.evidence)
+            supplier_name = context.supplier.name if context.supplier else "Unknown"
 
-## Evidence
-{evidence_summary}
+            # Build prompt
+            prompt = f"""You are the Analyst agent in SentinelChain, a supply chain risk analysis system.
 
-## Instructions
-1. Review each piece of evidence carefully.
-2. Identify risk factors across these categories:
-   - FINANCIAL (cash flow, debt, credit rating)
-   - GEOPOLITICAL (trade wars, sanctions, port strikes, political instability)
-   - REGULATORY (sanctions lists, export controls, new laws)
-   - ESG (environmental violations, labor disputes, carbon footprint)
-   - OPERATIONAL (factory fires, shipping delays, quality failures)
-   - REPUTATIONAL (scandals, negative press, lawsuits)
-3. Assign a RiskLevel to each: LOW, MEDIUM, HIGH, SEVERE, or CRITICAL
-4. Assign a confidence score (0.0 to 1.0) based on evidence quality
-5. For each risk factor, cite at least one evidence URL/document ID as the source
-6. If evidence is insufficient to reach a confident assessment, say so explicitly and request more data from Scout.
+    Your task: analyze the following evidence about supplier "{supplier_name}" and identify risk factors.
 
-## Output Format (STRICT JSON - do not deviate)
-{{
-  "risk_factors": [
+    ## Evidence
+    {evidence_summary}
+
+    ## Instructions
+    1. Review each piece of evidence carefully.
+    2. Identify risk factors across these categories:
+       - FINANCIAL (cash flow, debt, credit rating)
+       - GEOPOLITICAL (trade wars, sanctions, port strikes, political instability)
+       - REGULATORY (sanctions lists, export controls, new laws)
+       - ESG (environmental violations, labor disputes, carbon footprint)
+       - OPERATIONAL (factory fires, shipping delays, quality failures)
+       - REPUTATIONAL (scandals, negative press, lawsuits)
+    3. Assign a RiskLevel to each: LOW, MEDIUM, HIGH, SEVERE, or CRITICAL
+    4. Assign a confidence score (0.0 to 1.0) based on evidence quality
+    5. For each risk factor, cite at least one evidence URL/document ID as the source
+    6. If evidence is insufficient to reach a confident assessment, say so explicitly and request more data from Scout.
+
+    ## Output Format (STRICT JSON - do not deviate)
     {{
-      "id": "rf-<uuid>",
-      "category": "<RISK_CATEGORY>",
-      "level": "<RISK_LEVEL>",
-      "title": "<short title>",
-      "description": "<1-2 sentence description>",
-      "confidence": <float>,
-      "evidence_ids": ["<evidence_id>"],
-      "metadata": {{}}
+      "risk_factors": [
+        {{
+          "id": "rf-<uuid>",
+          "category": "<RISK_CATEGORY>",
+          "level": "<RISK_LEVEL>",
+          "title": "<short title>",
+          "description": "<1-2 sentence description>",
+          "confidence": <float>,
+          "evidence_ids": ["<evidence_id>"],
+          "metadata": {{}}
+        }}
+      ],
+      "needs_more_evidence": <bool>,
+      "summary": "<1 paragraph summary>"
     }}
-  ],
-  "needs_more_evidence": <bool>,
-  "summary": "<1 paragraph summary>"
-}}
-"""
-        
-        # Check cache first
-        cached = await self.memory_manager.get_cached_llm_call(prompt, self.llm_config.get("model", "claude-3-5-sonnet"), str(context.supplier_id) if context.supplier_id else "")
-        if cached:
-            return self._parse_risk_factors(cached, context)
-        
-        # Call LLM (using Anthropic via LangChain)
-        try:
-            from langchain_anthropic import ChatAnthropic
-            from langchain_core.messages import HumanMessage
-            
-            llm = ChatAnthropic(
-                model=self.llm_config.get("model", "claude-3-5-sonnet-20241022"),
-                temperature=self.llm_config.get("temperature", 0.1),
-                max_tokens=self.llm_config.get("max_tokens", 8192)
-            )
-            
-            response = await llm.ainvoke([HumanMessage(content=prompt)])
-            raw_output = response.content
-            
-            # Validate with Guardrails
-            validated = await self.guardrails.validate_risk_output(raw_output)
-            
-            # Cache successful result
-            await self.memory_manager.cache_llm_call(prompt, validated, self.llm_config.get("model", "claude-3-5-sonnet"), str(context.supplier_id) if context.supplier_id else "")
-            
-            return self._parse_risk_factors(validated, context)
-            
-        except Exception as e:
-            self.logger.error("LLM analysis failed", error=str(e))
-            # Return fallback - request more evidence
-            return []
+
+    """
+            # Check cache first
+            cached = await self.memory_manager.get_cached_llm_call(prompt, self.llm_config.get("model", "claude-3-5-sonnet"), str(context.supplier_id) if context.supplier_id else "")
+            if cached:
+                return self._parse_risk_factors(cached, context)
+
+            # Call LLM via gateway (with failover + cost tracking)
+            messages = [{"role": "user", "content": prompt}]
+            try:
+                response = await self._call_llm(
+                    messages=messages,
+                    role=ProviderRole.PRIMARY,
+                    temperature=self.llm_config.get("temperature", 0.1),
+                    max_tokens=self.llm_config.get("max_tokens", 8192),
+                )
+                raw_output = response.choices[0].message.content
+
+                # Validate with Guardrails
+                validated = await self.guardrails.validate_risk_output(raw_output)
+
+                # Cache successful result
+                await self.memory_manager.cache_llm_call(prompt, validated, self.llm_config.get("model", "claude-3-5-sonnet"), str(context.supplier_id) if context.supplier_id else "")
+
+                return self._parse_risk_factors(validated, context)
+
+            except Exception as e:
+                self.logger.error("LLM analysis failed", error=str(e))
+                return []
     
     def _prepare_evidence_summary(self, evidence: List[Evidence]) -> str:
         """Prepare evidence for LLM prompt"""
@@ -709,125 +705,123 @@ class MitigatorAgent(BaseAgent):
         )
     
     async def _generate_mitigations(self, context: AgentContext) -> List[MitigationAction]:
-        """Generate mitigation actions for identified risks using LLM"""
-        await self._initialize_services()
-        
-        if not context.risk_factors:
-            return []
-        
-        # Prepare risk factors for LLM
-        risk_summary = []
-        for rf in context.risk_factors:
-            risk_summary.append({
-                "id": str(rf.id),
-                "category": rf.category.value,
-                "level": rf.level.value,
-                "title": rf.title,
-                "description": rf.description,
-                "confidence": rf.confidence
-            })
-        
-        supplier_name = context.supplier.name if context.supplier else "Unknown"
-        
-        prompt = f"""You are the Mitigator agent in SentinelChain. Given the following identified risk factors for supplier "{supplier_name}", generate mitigation actions and suggest alternative suppliers.
+            """Generate mitigation actions for identified risks using LLM via gateway"""
+            await self._initialize_services()
 
-## Risk Factors
-{json.dumps(risk_summary, indent=2)}
+            if not context.risk_factors:
+                return []
 
-## Instructions
-1. For each HIGH, SEVERE, and CRITICAL risk factor, generate 1-3 specific mitigation actions.
-2. Mitigation actions must include: title, description, estimated_cost_usd, estimated_timeline_days, priority (HIGH/MEDIUM/LOW)
-3. Suggest 3 alternative suppliers (real or plausible industry peers) with:
-   - name, country, industry, estimated_risk_score, cost_advantage_pct, lead_time_days
+            # Prepare risk factors for LLM
+            risk_summary = []
+            for rf in context.risk_factors:
+                risk_summary.append({
+                    "id": str(rf.id),
+                    "category": rf.category.value,
+                    "level": rf.level.value,
+                    "title": rf.title,
+                    "description": rf.description,
+                    "confidence": rf.confidence
+                })
 
-## Output Format (STRICT JSON)
-{{
-  "mitigation_actions": [
+            supplier_name = context.supplier.name if context.supplier else "Unknown"
+
+            prompt = f"""You are the Mitigator agent in SentinelChain. Given the following identified risk factors for supplier "{supplier_name}", generate mitigation actions and suggest alternative suppliers.
+
+    ## Risk Factors
+    {json.dumps(risk_summary, indent=2)}
+
+    ## Instructions
+    1. For each HIGH, SEVERE, and CRITICAL risk factor, generate 1-3 specific mitigation actions.
+    2. Mitigation actions must include: title, description, estimated_cost_usd, estimated_timeline_days, priority (HIGH/MEDIUM/LOW)
+    3. Suggest 3 alternative suppliers (real or plausible industry peers) with:
+       - name, country, industry, estimated_risk_score, cost_advantage_pct, lead_time_days
+
+    ## Output Format (STRICT JSON)
     {{
-      "id": "ma-<uuid>",
-      "risk_factor_id": "<rf_id>",
-      "title": "<action title>",
-      "description": "<detailed description>",
-      "action_type": "<type>",
-      "estimated_cost_usd": <number|null>,
-      "estimated_timeline_days": <number|null>,
-      "priority": <1-5>,
-      "status": "PROPOSED"
+      "mitigation_actions": [
+        {{
+          "id": "ma-<uuid>",
+          "risk_factor_id": "<rf_id>",
+          "title": "<action title>",
+          "description": "<detailed description>",
+          "action_type": "<type>",
+          "estimated_cost_usd": <number|null>,
+          "estimated_timeline_days": <number|null>,
+          "priority": <1-5>,
+          "status": "PROPOSED"
+        }}
+      ],
+      "alternative_suppliers": [
+        {{
+          "id": "as-<uuid>",
+          "original_supplier_id": "<supplier_id>",
+          "name": "<supplier name>",
+          "country": "<country>",
+          "risk_score": <0-100>,
+          "cost_difference_pct": <number|null>,
+          "lead_time_days": <number|null>,
+          "quality_rating": <number|null>,
+          "certifications": []
+        }}
+      ],
+      "summary": "<1 paragraph summary>"
     }}
-  ],
-  "alternative_suppliers": [
-    {{
-      "id": "as-<uuid>",
-      "original_supplier_id": "<supplier_id>",
-      "name": "<supplier name>",
-      "country": "<country>",
-      "risk_score": <0-100>,
-      "cost_difference_pct": <number|null>,
-      "lead_time_days": <number|null>,
-      "quality_rating": <number|null>,
-      "certifications": []
-    }}
-  ],
-  "summary": "<1 paragraph summary>"
-}}
-"""
-        
-        try:
-            from langchain_anthropic import ChatAnthropic
-            from langchain_core.messages import HumanMessage
-            
-            llm = ChatAnthropic(
-                model=self.llm_config.get("model", "claude-3-5-sonnet-20241022"),
-                temperature=0.1,
-                max_tokens=8192
-            )
-            
-            response = await llm.ainvoke([HumanMessage(content=prompt)])
-            validated = await self.guardrails.validate_mitigation_output(response.content)
-            
-            # Parse into objects
-            actions = []
-            for ma_data in validated.get("mitigation_actions", []):
-                try:
-                    actions.append(MitigationAction(
-                        risk_factor_id=UUID(ma_data["risk_factor_id"]),
-                        title=ma_data["title"],
-                        description=ma_data["description"],
-                        action_type=ma_data["action_type"],
-                        estimated_cost=ma_data.get("estimated_cost_usd"),
-                        estimated_timeline_days=ma_data.get("estimated_timeline_days"),
-                        priority=ma_data.get("priority", 3)
-                    ))
-                except Exception as e:
-                    self.logger.error("Failed to parse mitigation action", error=str(e))
-            
-            alternatives = []
-            for alt_data in validated.get("alternative_suppliers", []):
-                try:
-                    alternatives.append(AlternativeSupplier(
-                        original_supplier_id=context.supplier_id or UUID(alt_data["original_supplier_id"]),
-                        name=alt_data["name"],
-                        country=alt_data["country"],
-                        risk_score=alt_data["risk_score"],
-                        cost_difference_pct=alt_data.get("cost_difference_pct"),
-                        lead_time_days=alt_data.get("lead_time_days"),
-                        quality_rating=alt_data.get("quality_rating"),
-                        certifications=alt_data.get("certifications", [])
-                    ))
-                except Exception as e:
-                    self.logger.error("Failed to parse alternative supplier", error=str(e))
-            
-            # Store in vector store for future reference
-            for alt in alternatives:
-                text = f"{alt.name} {alt.country} {alt.risk_score}"
-                embedding = await self.embeddings.embed(text)
-                await self.memory_manager.vector_store.upsert_evidence(alt.id, embedding, alt.metadata)
-            
-            return actions
-            
-        except Exception as e:
-            self.logger.error("LLM mitigation generation failed", error=str(e))
-            return []
+
+    """
+            try:
+                # Call LLM via gateway (with failover + cost tracking)
+                messages = [{"role": "user", "content": prompt}]
+                response = await self._call_llm(
+                    messages=messages,
+                    role=ProviderRole.PRIMARY,
+                    temperature=0.1,
+                    max_tokens=8192
+                )
+                validated = await self.guardrails.validate_mitigation_output(response.choices[0].message.content)
+
+                # Parse into objects
+                actions = []
+                for ma_data in validated.get("mitigation_actions", []):
+                    try:
+                        actions.append(MitigationAction(
+                            risk_factor_id=UUID(ma_data["risk_factor_id"]),
+                            title=ma_data["title"],
+                            description=ma_data["description"],
+                            action_type=ma_data["action_type"],
+                            estimated_cost=ma_data.get("estimated_cost_usd"),
+                            estimated_timeline_days=ma_data.get("estimated_timeline_days"),
+                            priority=ma_data.get("priority", 3)
+                        ))
+                    except Exception as e:
+                        self.logger.error("Failed to parse mitigation action", error=str(e))
+
+                alternatives = []
+                for alt_data in validated.get("alternative_suppliers", []):
+                    try:
+                        alternatives.append(AlternativeSupplier(
+                            original_supplier_id=context.supplier_id or UUID(alt_data["original_supplier_id"]),
+                            name=alt_data["name"],
+                            country=alt_data["country"],
+                            risk_score=alt_data["risk_score"],
+                            cost_difference_pct=alt_data.get("cost_difference_pct"),
+                            lead_time_days=alt_data.get("lead_time_days"),
+                            quality_rating=alt_data.get("quality_rating"),
+                            certifications=alt_data.get("certifications", [])
+                        ))
+                    except Exception as e:
+                        self.logger.error("Failed to parse alternative supplier", error=str(e))
+
+                # Store in vector store for future reference
+                for alt in alternatives:
+                    text = f"{alt.name} {alt.country} {alt.risk_score}"
+                    embedding = await self.embeddings.embed(text)
+                    await self.memory_manager.vector_store.upsert_evidence(alt.id, embedding, alt.metadata)
+
+                return actions
+
+            except Exception as e:
+                self.logger.error("LLM mitigation generation failed", error=str(e))
+                return []
     
     async def _find_alternatives(self, context: AgentContext) -> List[AlternativeSupplier]:
         """Find alternative suppliers using vector search"""

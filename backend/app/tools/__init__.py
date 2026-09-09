@@ -585,7 +585,8 @@ class ToolRegistry:
     def __init__(self, config: Dict[str, Any] = None):
         self.config = config or get_config().tools
         self.tools: Dict[str, BaseTool] = {}
-        self.mcp_manager = MCPToolManager(config.get("mcp") if config else None)
+        mcp_config = config.get("mcp") if isinstance(config, dict) else (getattr(config, "mcp", None) if config else None)
+        self.mcp_manager = MCPToolManager(mcp_config)
         self._initialize_tools()
     
     def _initialize_tools(self):
@@ -623,6 +624,10 @@ def get_tool_registry(config: Dict[str, Any] = None) -> ToolRegistry:
     """Get or create tool registry"""
     global _tool_registry
     if _tool_registry is None:
+        if config is None:
+            from app.config import get_config
+            cfg = get_config()
+            config = cfg.tools.model_dump() if hasattr(cfg.tools, 'model_dump') else cfg.tools
         _tool_registry = ToolRegistry(config)
     return _tool_registry
 

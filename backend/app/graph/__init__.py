@@ -4,6 +4,7 @@ LangGraph workflow for SentinelChain multi-agent orchestration
 from typing import Dict, Any, List, Optional, Literal, Annotated
 from uuid import UUID, uuid4
 from datetime import datetime
+import asyncio
 import operator
 import structlog
 
@@ -106,7 +107,7 @@ async def scout_node(state: GraphState) -> GraphState:
     
     # Create Scout agent with tools
     config = get_config()
-    tool_registry = ToolRegistry(config.tools)
+    tool_registry = ToolRegistry(config.tools.model_dump() if hasattr(config.tools, 'model_dump') else config.tools)
     
     scout = ScoutAgent(config={
         "tools": tool_registry.tools,
@@ -145,7 +146,8 @@ async def analyst_node(state: GraphState) -> GraphState:
     logger.info("Executing Analyst node", workflow_id=str(state.workflow_id))
     
     config = get_config()
-    tool_registry = ToolRegistry(config.tools)
+    tools_config = config.tools.model_dump() if hasattr(config.tools, 'model_dump') else config.tools
+    tool_registry = ToolRegistry(tools_config)
     
     analyst = AnalystAgent(config={
         "tools": tool_registry.tools,
@@ -220,7 +222,8 @@ async def mitigator_node(state: GraphState) -> GraphState:
     logger.info("Executing Mitigator node", workflow_id=str(state.workflow_id))
     
     config = get_config()
-    tool_registry = ToolRegistry(config.tools)
+    tools_config = config.tools.model_dump() if hasattr(config.tools, 'model_dump') else config.tools
+    tool_registry = ToolRegistry(tools_config)
     
     mitigator = MitigatorAgent(config={
         "tools": tool_registry.tools,
@@ -565,6 +568,18 @@ class SentinelWorkflowRunner:
                                  workflow_id=str(state.workflow_id),
                                  evidence=len(evidence_id_map),
                                  risk_factors=len(factor_row_ids))
+
+            # Keep the supplier's roll-up score in sync with new findings
+            if state.supplier_id and (factor_row_ids or evidence_id_map):
+                try:
+                    new_score = await self.memory.db.recalculate_supplier_risk(state.supplier_id)
+                    self.logger.info("Supplier risk score recalculated",
+                                     workflow_id=str(state.workflow_id),
+                                     supplier_id=str(state.supplier_id),
+                                     risk_score=new_score)
+                except Exception as exc:
+                    self.logger.warning("Risk score recalculation failed",
+                                        workflow_id=str(state.workflow_id), error=str(exc))
         except Exception as exc:
             self.logger.warning("Failed to persist LangGraph findings",
                                 workflow_id=str(state.workflow_id), error=str(exc))
@@ -589,6 +604,96 @@ class SentinelWorkflowRunner:
                 workflow_id=str(state.workflow_id),
                 error=str(exc),
             )
+
+        # Human-in-the-loop follow-ups
+        if state.status == "WAITING_HITL":
+            self._notify_hitl_required(state)
+            self._schedule_hitl_timeout(str(state.workflow_id))
+        elif state.status == "ESCALATED":
+            from app.services.notifications import send_slack_message
+            import asyncio as _asyncio
+
+            _asyncio.get_running_loop().create_task(
+                send_slack_message(
+                    f":rotating_light: SentinelChain workflow `{state.workflow_id}` "
+                    f"was ESCALATED and needs senior compliance review."
+                )
+            )
+
+    def _notify_hitl_required(self, state: GraphState) -> None:
+        """Best-effort Slack ping that human approval is needed."""
+        import asyncio as _asyncio
+
+        from app.services.notifications import send_slack_message
+
+        supplier = state.state_data.get("supplier_name") or str(state.supplier_id or "unknown")
+        _asyncio.get_running_loop().create_task(
+            send_slack_message(
+                f":warning: SentinelChain HITL approval required for workflow "
+                f"`{state.workflow_id}` (supplier: {supplier}). "
+                f"It will auto-escalate if unanswered."
+            )
+        )
+
+    def _schedule_hitl_timeout(self, workflow_id: str, timeout_seconds: int = None) -> None:
+        """Start the escalation countdown for a WAITING_HITL workflow."""
+        import asyncio as _asyncio
+
+        from app.services.notifications import hitl_timeout_seconds
+
+        if not hasattr(self, "_hitl_tasks"):
+            self._hitl_tasks = {}
+        self._cancel_hitl_timeout(workflow_id)
+        seconds = timeout_seconds if timeout_seconds is not None else hitl_timeout_seconds()
+        self._hitl_tasks[workflow_id] = _asyncio.get_running_loop().create_task(
+            self._hitl_timeout_worker(workflow_id, seconds)
+        )
+
+    def _cancel_hitl_timeout(self, workflow_id: str) -> None:
+        tasks = getattr(self, "_hitl_tasks", None)
+        if tasks and workflow_id in tasks:
+            task = tasks.pop(workflow_id)
+            if not task.done():
+                task.cancel()
+
+    async def _hitl_timeout_worker(self, workflow_id: str, timeout_seconds: int) -> None:
+        """Escalate a still-waiting workflow once the approval window lapses."""
+        try:
+            await asyncio.sleep(timeout_seconds)
+        except asyncio.CancelledError:
+            return
+
+        try:
+            state = await self.memory.get_workflow_state(UUID(workflow_id))
+        except Exception as exc:
+            self.logger.warning("HITL escalation check failed",
+                                workflow_id=workflow_id, error=str(exc))
+            return
+
+        if not state or state.status != "WAITING_HITL":
+            return  # already resolved
+
+        self.logger.warning("HITL approval window lapsed - escalating",
+                            workflow_id=workflow_id)
+        state.hitl_status = HITLStatus.ESCALATED
+        state.status = "ESCALATED"
+        state.updated_at = datetime.utcnow()
+        await self.memory.save_workflow_state(state)
+        await self._publish_terminal_event(state)
+
+    async def resume_after_hitl(self, workflow_id: UUID, hitl_response: Dict[str, Any]) -> GraphState:
+        """Resume workflow after HITL response"""
+        self._cancel_hitl_timeout(str(workflow_id))
+
+        # Get current state
+        current_state = await self.memory.get_workflow_state(workflow_id)
+        if not current_state:
+            raise ValueError(f"Workflow {workflow_id} not found")
+
+        # Add HITL response to state
+        current_state.hitl_response = hitl_response
+
+        return await self._run_graph(current_state)
 
     async def run_autonomous_discovery(self, supplier_id: UUID, workflow_id: UUID = None) -> GraphState:
         """Run autonomous risk discovery workflow (Workflow 1)"""
@@ -712,8 +817,18 @@ class SentinelWorkflowRunner:
             self.logger.warning("Failed to persist crew risk factors",
                                 workflow_id=str(state.workflow_id), error=str(exc))
 
+        # Keep the supplier's roll-up score in sync with new findings
+        if state.supplier_id:
+            try:
+                await self.memory.db.recalculate_supplier_risk(state.supplier_id)
+            except Exception as exc:
+                self.logger.warning("Risk score recalculation failed",
+                                    workflow_id=str(state.workflow_id), error=str(exc))
+
     async def resume_after_hitl(self, workflow_id: UUID, hitl_response: Dict[str, Any]) -> GraphState:
         """Resume workflow after HITL response"""
+        self._cancel_hitl_timeout(str(workflow_id))
+
         # Get current state
         current_state = await self.memory.get_workflow_state(workflow_id)
         if not current_state:

@@ -48,7 +48,13 @@ class PIIMasker:
         self._init_presidio()
     
     def _init_presidio(self) -> None:
-        """Initialize Presidio if available"""
+        """Initialize Presidio if available and enabled in config"""
+        # Check if Presidio is explicitly disabled in config
+        if self.config.get("presidio", {}).get("enabled") is False:
+            logger.info("Presidio explicitly disabled in config, using regex-based masking")
+            self._use_presidio = False
+            return
+            
         try:
             from presidio_analyzer import AnalyzerEngine
             from presidio_anonymizer import AnonymizerEngine
